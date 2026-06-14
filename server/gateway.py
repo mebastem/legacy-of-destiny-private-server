@@ -22,6 +22,7 @@ from luaproto import LuaProto
 import opcodes as op
 import content
 import storage
+import items
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -43,6 +44,7 @@ MAPMONSTER_CFG = proto.lua.require("public.staticdata.tb_mapmonster")
 MONSTERINFO_CFG = proto.lua.require("public.staticdata.tb_monsterinfo")
 SKILLS_CFG = proto.lua.require("public.staticdata.tb_skills")  # target_num_k = max monster targets
 TASK_CFG = proto.lua.require("public.staticdata.tb_task")      # quest defs: next_task, award, ...
+TB_ITEM = proto.lua.require("public.staticdata.tb_item")       # item defs: item_type, ...
 
 # quest state values (business.txt TASK_STATUS) and update types (UPDATE_TASK)
 TS_CAN_ACCEPT, TS_ACCEPTED, TS_CAN_COMMIT, TS_COMMIT = 2, 3, 4, 5
@@ -86,6 +88,23 @@ def compute_power(attr_pairs) -> int:
     for aid, val in attr_pairs:
         total += POWER_WEIGHTS.get(aid, 0) * int(val)
     return int(total)
+
+
+def player_attrs(s: Session) -> list:
+    """Base attributes with the character's own sex/profession/camp."""
+    return [(aid, v) for (aid, v) in PLAYER_BASE_ATTRS
+            if aid not in (102, 108, 109)] + [(102, s.sex), (108, s.profession), (109, s.camp)]
+
+
+def total_power(s: Session) -> int:
+    """战力 from base attributes plus equipped gear's power score."""
+    p = compute_power(player_attrs(s))
+    c = storage.find_by_pid(s.player_id)
+    for itemid in (c.get("equipped", {}).values() if c else []):
+        row = TB_ITEM[int(itemid)]
+        if row is not None and row["effect_value"] is not None:
+            p += int(row["effect_value"]["score"] or 0)
+    return p
 
 
 def monster_exp(mapmonster_key: int) -> int:
@@ -135,7 +154,7 @@ def skills_for(profession: int) -> list:
 
 def save_session(s: "Session"):
     """Persist the live character state (level/exp/map/pos)."""
-    if not s.player_id:
+    if not s.player_id or not s.in_world:    # never overwrite from a non-world session
         return
     c = storage.find_by_pid(s.player_id)
     if c:
@@ -165,6 +184,7 @@ class Session:
         self.x = 440
         self.y = 1360
         self.alive = True
+        self.in_world = False          # set once enter-world loads the character
         self.time_task = None
         self.spawn_task = None
         self.atk = 200                 # player attack (from enter-world attrs)
@@ -174,6 +194,7 @@ class Session:
         self.nickname = "Hero"
         self.gold = 0
         self.diamond = 0
+        self.item_uid = 7000000
         # progression (loaded from storage on enter-world)
         self.level = 1
         self.exp = 0
@@ -225,6 +246,17 @@ async def spawn_world(s: Session):
             n[e["type"]] = n.get(e["type"], 0) + 1
         log.info("pushed CL_AOI map %d: %d monsters, %d npcs, %d teleports",
                  s.mapid, n[2], n[3], n[4])
+        # restore the player's saved inventory (the bag was just initialized empty)
+        c = storage.find_by_pid(s.player_id)
+        for it in (c.get("items", []) if c else []):
+            row = TB_ITEM[it["itemid"]]
+            if row is None:
+                continue
+            is_equip = int(row["item_type"]) == 3
+            pos = it.get("bag", items.pos_for(int(row["item_type"]), is_equip))
+            body = items.encode_add(it["uid"], it["itemid"], it["count"], pos, is_equip)
+            s.writer.write(HEADER.pack(0, op.CL_UPDATE_ITEMS, len(body)) + body)
+        await s.writer.drain()
     except (ConnectionError, asyncio.CancelledError):
         pass
     except Exception as e:
@@ -323,6 +355,7 @@ async def on_create_player(s: Session, req: dict):
 @handler(op.GW_LOGIN_GATEWAY)
 async def on_login_gateway(s: Session, req: dict):
     s.player_id = str(req.get("m_nPlayerID", DEMO_PID))
+    s.in_world = True
     char = storage.find_by_pid(s.player_id)
     if char:   # load the saved character
         s.level, s.exp = char["level"], char["exp"]
@@ -335,15 +368,12 @@ async def on_login_gateway(s: Session, req: dict):
     if s.time_task is None:
         s.time_task = asyncio.create_task(time_pusher(s))
     _start_spawn(s)                       # populate the map a few seconds after entry
-    # base attrs but with the character's own profession/sex/camp
-    attrs = [(aid, v) for (aid, v) in PLAYER_BASE_ATTRS
-             if aid not in (102, 108, 109)] + [(102, s.sex), (108, s.profession), (109, s.camp)]
     return [(op.GW_LOGIN_GATEWAY, {
         "m_nRetCode": 0,
         "playerid": s.player_id,
         "nickname": s.nickname,
         "mapid": s.mapid, "x": s.x, "y": s.y,    # spawn where the character logged out
-        "m_vecAttr": _flatten(attrs) + [101, s.level, 104, compute_power(attrs)],
+        "m_vecAttr": _flatten(player_attrs(s)) + [101, s.level, 104, total_power(s)],
         "skills": skills_for(s.profession),       # the character's profession skills
         "m_strGuildName": "", "m_nGuildID": 0, "m_nGuildJob": 0,
         "m_nExp": 0, "m_nAOISetting": 0, "m_nCreatedTime": 0,
@@ -352,6 +382,9 @@ async def on_login_gateway(s: Session, req: dict):
         # empty inventory — initializes the bag so the main-view (and skill bar /
         # fight buttons) can finish setting up instead of crashing on pairs(nil)
         "m_vecItem": [], "m_vecEquip": [], "m_vecTreasure": [], "m_vecWarSoul": [],
+    }), (op.CL_UPDATE_INFO, {
+        # level/exp for the HUD bar (it reads UPDATE_INFO, not just the attribute)
+        "m_vecInfo": [1, s.level, 2, s.exp],       # UPDATE_INFO.LEVEL, EXP
     }), (op.CL_PLAYER_MONEY, {
         "m_vecMoney": [1, s.diamond, 2, s.gold],   # DIAMOND, GOLD
     }), (op.CL_PLAYER_TASKS, {
@@ -567,8 +600,36 @@ def _give_award(s: Session, task_id: int):
             grant_exp(s, count)
         elif atype == 2:                       # MONEY (aid = MONEY_TYPE: 1 diamond, 2 gold)
             grant_money(s, aid, count)
-        # AWARD_TYPE.ITEM(1) -> inventory (next)
+        elif atype == 1:                       # ITEM -> add to bag
+            give_item(s, aid, count)
         i += 1
+
+
+def give_item(s: Session, itemid: int, count: int = 1):
+    """Add an item to the player (persisted) and push it. Equipment auto-equips to
+    the worn slot (so it shows on the gear panel, not just the bag)."""
+    row = TB_ITEM[itemid]
+    if row is None:
+        return
+    itype = int(row["item_type"])
+    is_equip = itype == 3
+    worn = is_equip                              # gear goes straight onto the character
+    pos = items.pos_for(itype, worn)             # ITEM_POS routing value
+    s.item_uid += 1
+    uid = s.item_uid
+    c = storage.find_by_pid(s.player_id)
+    if c is not None:
+        c.setdefault("items", []).append(
+            {"uid": uid, "itemid": int(itemid), "count": int(count), "bag": pos})
+        if worn:
+            c.setdefault("equipped", {})[str(uid)] = int(itemid)
+        storage.save()
+    body = items.encode_add(uid, int(itemid), int(count), pos, is_equip)
+    s.writer.write(HEADER.pack(0, op.CL_UPDATE_ITEMS, len(body)) + body)
+    if worn:
+        s.power = total_power(s)
+        s.push_aoi([{"type": 11, "m_nAvatarID": s.player_id or DEMO_PID, "m_vecAttr": [104, s.power]}])
+    log.info("ITEM +%d x%d (pos %d%s)", itemid, count, pos, " worn" if worn else "")
 
 
 def grant_money(s: Session, money_type: int, amount: int):
@@ -626,6 +687,27 @@ async def on_task_op(s: Session, req: dict):
         log.info("QUEST submit %d -> next %d", tid, nxt)
     storage.save()
     return [(op.GW_TASK_OP, {"m_nRetCode": 0})]
+
+
+@handler(op.GW_EQUIP_WEAR)
+async def on_equip_wear(s: Session, req: dict):
+    opt = int(req.get("m_nOpt", 1))                # 1 wear, 2 remove
+    uid = str(req.get("m_nUniqueID", 0))
+    c = storage.find_by_pid(s.player_id)
+    if c is not None:
+        equipped = c.setdefault("equipped", {})
+        if opt == 1:
+            itemid = next((it["itemid"] for it in c.get("items", []) if str(it["uid"]) == uid), None)
+            if itemid is not None:
+                equipped[uid] = int(itemid)
+        else:
+            equipped.pop(uid, None)
+        s.power = total_power(s)
+        storage.save()
+        s.push_aoi([{"type": 11, "m_nAvatarID": s.player_id or DEMO_PID,
+                     "m_vecAttr": [104, s.power]}])   # refresh POWER on the HUD
+        log.info("EQUIP %s uid=%s -> power=%d", "wear" if opt == 1 else "remove", uid, s.power)
+    return [(op.GW_EQUIP_WEAR, {"m_nRetCode": 0})]
 
 
 @handler(op.GW_PICKUP)

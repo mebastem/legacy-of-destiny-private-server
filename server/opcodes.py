@@ -23,6 +23,7 @@ GW_TASK_OP       = 0x00050012  # quest accept/submit: req {m_nOpType(1=accept,2=
 GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
+GW_EQUIP_WEAR    = 0x0005001E  # equip/unequip: req {m_nOpt(1=wear,2=remove), m_nUniqueID}
 GW_EQUIP_PANEL   = 0x00050024  # equip panel query {atk,def,hp,index}
 GW_OFFICE        = 0x0005002E  # military rank/office {ret,opt,level,used,max}
 GW_FUNCTION_NOTICE = 0x000500C6  # feature-unlock notice {ret,noticeID}
@@ -33,5 +34,6 @@ CL_AOI           = 0x80070001  # server -> client AOI events (spawn/move/del ent
 CL_PLAYER_MONEY  = 0x80070002  # server -> client wallet {m_vecMoney:[type,amount,...]}
 CL_PLAYER_ITEMS  = 0x80070003  # server -> client full inventory (init the bag)
 CL_UPDATE_INFO   = 0x80070004  # server -> client info updates (exp/level/...) {m_vecInfo:[type,val,...]}
+CL_UPDATE_ITEMS  = 0x80070006  # server -> client item add/del/update
 CL_UPDATE_TASK   = 0x80070007  # server -> client quest changes {m_vecUpdateInfo:[{taskId,updType,value}]}
 CL_PLAYER_TASKS  = 0x80070008  # server -> client the player's quests {m_vecTask:[{taskId,state,..}]}
