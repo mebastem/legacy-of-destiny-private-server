@@ -29,3 +29,4 @@ GW_FUNCTION_NOTICE = 0x000500C6  # feature-unlock notice {ret,noticeID}
 CL_SERVER_TIME   = 0x00070053  # server -> client time push {m_nTime:uint32}; keeps socket alive
 CL_AOI           = 0x80070001  # server -> client AOI events (spawn/move/del entities)
 CL_PLAYER_ITEMS  = 0x80070003  # server -> client full inventory (init the bag)
+CL_UPDATE_INFO   = 0x80070004  # server -> client info updates (exp/level/...) {m_vecInfo:[type,val,...]}

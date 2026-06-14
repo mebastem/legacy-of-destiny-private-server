@@ -35,6 +35,59 @@ proto = LuaProto()
 
 # the client's own teleport config: tb_teleport[currentMapId][teleportIndex] -> {to_mapid,to_x,to_z}
 TELEPORT_CFG = proto.lua.require("public.staticdata.tb_teleport")
+# exp needed to advance from a given level: tb_lvexp[level].next_lv_exp
+LVEXP_CFG = proto.lua.require("public.staticdata.tb_lvexp")
+# real game data for exact exp/power
+MAPMONSTER_CFG = proto.lua.require("public.staticdata.tb_mapmonster")
+MONSTERINFO_CFG = proto.lua.require("public.staticdata.tb_monsterinfo")
+# 战力 weights by attr id, exact from tb_paramter.power (tb_paramter has load-order
+# deps that prevent standalone require). power = floor(sum(weight[id]*value)).
+POWER_WEIGHTS = {1: 9, 2: 18, 3: 1, 4: 66, 5: 83, 6: 50, 7: 66, 8: 25,
+                 9: 200, 10: 20, 11: 10, 12: 20}
+
+# player base attributes [(attrId, value)] (ids from business.txt ATTR_TYPE).
+# Per-level base-stat growth was server-side (not in the client data), so these are
+# fixed starter stats; POWER is computed from them with the real formula.
+PLAYER_BASE_ATTRS = [
+    (1, 200),    # ATK
+    (2, 200),    # DEF
+    (3, 10000),  # MAXHP
+    (13, 600),   # SPEED
+    (15, 10000), # HP (current)
+    (102, 1),    # SEX
+    (103, 0),    # VIP
+    (108, 2),    # PROFESSION
+    (109, 1),    # CAMP
+]
+
+
+def exp_to_next(level: int) -> int:
+    row = LVEXP_CFG[level]
+    return int(row["next_lv_exp"]) if row is not None else 0
+
+
+def _flatten(attr_pairs) -> list:
+    out = []
+    for aid, val in attr_pairs:
+        out += [aid, val]
+    return out
+
+
+def compute_power(attr_pairs) -> int:
+    """Exact 战力 formula: sum of attr_value * power_weight[attr_id] (ids 1-12)."""
+    total = 0
+    for aid, val in attr_pairs:
+        total += POWER_WEIGHTS.get(aid, 0) * int(val)
+    return int(total)
+
+
+def monster_exp(mapmonster_key: int) -> int:
+    """Real exp reward for killing a monster (tb_monsterinfo[monsterid].exp)."""
+    mm = MAPMONSTER_CFG[mapmonster_key]
+    if mm is None:
+        return 0
+    info = MONSTERINFO_CFG[int(mm["monsterid"])]
+    return int(info["exp"]) if info is not None else 0
 
 # ---- toy persistent-ish state (in-memory; M3+ swaps for real storage) ----
 # one demo account -> its characters
@@ -72,7 +125,13 @@ class Session:
         self.y = 1360
         self.alive = True
         self.time_task = None
+        self.spawn_task = None
         self.atk = 200                 # player attack (from enter-world attrs)
+        # progression (mirrors the enter-world attrs)
+        self.level = 12
+        self.exp = 0
+        self.power = 5000
+        self.maxhp = 10000
         self.monsters: dict[str, int] = {}        # monster uid -> current hp
         self.monster_spawns: dict[str, dict] = {} # monster uid -> ADD_MONSTER template (for respawn)
         self.monster_reborn: dict[str, int] = {}  # monster uid -> respawn seconds
@@ -88,6 +147,14 @@ class Session:
         self.writer.write(HEADER.pack(0, op.CL_AOI, len(body)) + body)
 
 
+def _start_spawn(s: Session):
+    """(Re)start map population, cancelling any pending one so monsters can't stack
+    when login/teleport fire close together."""
+    if s.spawn_task:
+        s.spawn_task.cancel()
+    s.spawn_task = asyncio.create_task(spawn_world(s))
+
+
 async def spawn_world(s: Session):
     """After the scene loads, push the map's full AOI population (monsters, NPCs,
     teleports) at their real coordinates, built from the client's static data."""
@@ -95,11 +162,10 @@ async def spawn_world(s: Session):
     if not s.alive:
         return
     try:
-        events, reborn = content.build_map_aoi(proto, s.mapid)
+        events = content.build_map_aoi(proto, s.mapid)
         # remember each monster's HP + spawn template so attacks/respawns work
         s.monsters = {e["m_nUID"]: e["m_vecAttr"][1] for e in events if e["type"] == 2}
         s.monster_spawns = {e["m_nUID"]: e for e in events if e["type"] == 2}
-        s.monster_reborn = reborn
         body = proto.encode_aoi(events)
         s.writer.write(HEADER.pack(0, op.CL_AOI, len(body)) + body)
         await s.writer.drain()
@@ -118,17 +184,18 @@ async def kill_and_respawn(s: Session, uid: str):
     """Remove a dead monster after its death animation, then respawn it at its
     spawn point after the configured reborn time (cycle spawning)."""
     template = s.monster_spawns.get(uid)
-    reborn = s.monster_reborn.get(uid, 8)
+    reborn = random.randint(3, 12)                      # cycle respawn speed for a lively feel
+    home_map = s.mapid                                  # don't respawn onto a different map
     try:
         await asyncio.sleep(1.5)                       # let the death animation play
-        if not s.alive:
+        if not s.alive or s.mapid != home_map:
             return
         s.push_aoi([{"type": 7, "m_nAvatarID": uid}])  # AOI_DEL -> corpse disappears
         await s.writer.drain()
         if template is None:
             return
         await asyncio.sleep(reborn)                    # respawn delay
-        if not s.alive:
+        if not s.alive or s.mapid != home_map:
             return
         s.monsters[uid] = template["m_vecAttr"][1]      # restore full HP
         s.push_aoi([template])                          # re-spawn at its born point
@@ -207,7 +274,7 @@ async def on_login_gateway(s: Session, req: dict):
     log.info("LOGIN_GATEWAY enter-world pid=%s", s.player_id)
     if s.time_task is None:
         s.time_task = asyncio.create_task(time_pusher(s))
-    asyncio.create_task(spawn_world(s))   # populate the map a few seconds after entry
+    _start_spawn(s)                       # populate the map a few seconds after entry
     # minimal valid enter-world snapshot; spawn at map 1, tile (100,100).
     return [(op.GW_LOGIN_GATEWAY, {
         "m_nRetCode": 0,
@@ -216,21 +283,9 @@ async def on_login_gateway(s: Session, req: dict):
         # network coord = world coord * 10 (GetTransPosUp). Map 1 "Sunrise Village"
         # spawn (tb_map.enter) is world (x=44, z=136) -> network (440, 1360).
         "mapid": 1, "x": 440, "y": 1360,
-        # flat [attrId, value, ...] (ids from business.txt ATTR_TYPE). PROFESSION is
-        # required or SetBattleSkill crashes (default_skill[profession] == nil).
-        "m_vecAttr": [
-            1, 200,      # ATK
-            2, 200,      # DEF
-            3, 10000,    # MAXHP
-            13, 600,     # SPEED
-            15, 10000,   # HP (current)
-            101, 12,     # LEVEL
-            102, 1,      # SEX
-            103, 0,      # VIP
-            104, 5000,   # POWER
-            108, 2,      # PROFESSION (matches char list)
-            109, 1,      # CAMP
-        ],
+        # flat [attrId, value, ...]: base attrs + LEVEL + the REAL computed POWER
+        "m_vecAttr": _flatten(PLAYER_BASE_ATTRS)
+                     + [101, s.level, 104, compute_power(PLAYER_BASE_ATTRS)],
         # [skillId, level, ...] active skills for profession 2 (201 = basic attack).
         # Needed or the skill bar never inits and the attack button binds to nothing.
         "skills": [201, 1, 202, 1, 203, 1, 204, 1, 210, 1, 211, 1],
@@ -273,24 +328,58 @@ async def on_attack(s: Session, req: dict):
     crit = random.random() < 0.25
     dmg = random.randint(int(s.atk * 0.8), int(s.atk * 1.2)) * (2 if crit else 1)
     hp -= dmg
-    effect = 0x01 | (0x02 if crit else 0)            # HIT (+CRITICAL)
     dead = hp <= 0
-    if dead:
-        effect |= 0x04                               # DIE
-        s.monsters.pop(target, None)
-        asyncio.create_task(kill_and_respawn(s, target))   # despawn + respawn cycle
-    else:
-        s.monsters[target] = hp
-
+    effect = 0x01 | (0x02 if crit else 0) | (0x04 if dead else 0)   # HIT (+CRIT)(+DIE)
     pid = s.player_id or DEMO_PID
-    s.push_aoi([
+
+    events = [
         {"type": 9, "m_nAvatarID": pid, "m_nTargetID": target, "m_nSkillID": skill},      # ATTACK
         {"type": 10, "m_nAvatarID": target, "m_nAttackerID": pid,                          # DAMAGE
          "m_nEffect": effect, "m_nDamage": dmg, "m_nSkillID": skill},
-    ])
+    ]
+    if dead:
+        tmpl = s.monster_spawns.get(target)
+        exp_reward = monster_exp(int(tmpl["m_nMonsterID"])) if tmpl else 0   # REAL exp
+        s.monsters.pop(target, None)
+        asyncio.create_task(kill_and_respawn(s, target))    # despawn + respawn cycle
+    else:
+        s.monsters[target] = hp
+        # update the monster's HP bar (ATTR_CHANGE, HP attr = 15)
+        events.append({"type": 11, "m_nAvatarID": target, "m_vecAttr": [15, max(0, hp)]})
+
+    s.push_aoi(events)
+    if dead:
+        grant_exp(s, exp_reward)                            # real tb_monsterinfo.exp
     log.info("ATTACK target=%s dmg=%d%s hp_left=%d", target, dmg,
              " CRIT" if crit else "", max(0, hp))
     return [(op.GW_ATTACK, {"m_nRetCode": 0})]
+
+
+def grant_exp(s: Session, amount: int):
+    """Award the real monster exp and handle level-ups using the game's exp curve.
+    NOTE: per-level base-stat growth was server-side (not in the client data), so
+    leveling raises LEVEL/EXP only — power stays the real formula value over your
+    (gear/buff-driven) attributes, which we don't simulate."""
+    if amount <= 0:
+        return
+    s.exp += amount
+    leveled = False
+    while True:
+        need = exp_to_next(s.level)
+        if need and s.exp >= need:
+            s.exp -= need
+            s.level += 1
+            leveled = True
+        else:
+            break
+    info = [2, s.exp]                       # UPDATE_INFO.EXP
+    if leveled:
+        info += [1, s.level]               # UPDATE_INFO.LEVEL
+    s.push(op.CL_UPDATE_INFO, {"m_vecInfo": info})
+    if leveled:
+        s.push_aoi([{"type": 11, "m_nAvatarID": s.player_id or DEMO_PID,
+                     "m_vecAttr": [101, s.level]}])   # update LEVEL on the HUD
+        log.info("LEVEL UP -> %d (exp left %d)", s.level, s.exp)
 
 
 @handler(op.GW_PLAYER_MOVE)
@@ -310,7 +399,10 @@ async def on_teleport(s: Session, req: dict):
         log.warning("teleport %d on map %d not found: %s", tid, s.mapid, e)
         return [(op.GW_TELEPORT, {"m_nRetCode": 1, "m_nMapID": s.mapid, "x": s.x, "y": s.y})]
     s.mapid, s.x, s.y = to_map, to_x * 10, to_z * 10   # network coord = world*10
+    # drop the old map's monster state; the new map gets repopulated after it loads
+    s.monsters.clear(); s.monster_spawns.clear(); s.monster_reborn.clear()
     log.info("TELEPORT id=%d -> map %d at world(%d,%d)", tid, to_map, to_x, to_z)
+    _start_spawn(s)                       # populate the destination map's monsters
     return [(op.GW_TELEPORT, {"m_nRetCode": 0, "m_nMapID": to_map, "x": s.x, "y": s.y})]
 
 
