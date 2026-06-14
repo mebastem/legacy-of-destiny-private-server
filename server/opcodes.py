@@ -19,6 +19,7 @@ GW_TELEPORT      = 0x00050004  # portal teleport: req {type,teleportID,targetID}
 GW_TELEPORT_FINISH = 0x00050005  # client signals teleport done (cm_empty)
 GW_ATTACK        = 0x00050006
 GW_PICKUP        = 0x00050007  # pick up a dropped item: req {m_nDropbagID}
+GW_TASK_OP       = 0x00050012  # quest accept/submit: req {m_nOpType(1=accept,2=submit), m_nTaskId}
 GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
@@ -29,5 +30,8 @@ GW_FUNCTION_NOTICE = 0x000500C6  # feature-unlock notice {ret,noticeID}
 # client push channel (0x0007 / 0x8007)
 CL_SERVER_TIME   = 0x00070053  # server -> client time push {m_nTime:uint32}; keeps socket alive
 CL_AOI           = 0x80070001  # server -> client AOI events (spawn/move/del entities)
+CL_PLAYER_MONEY  = 0x80070002  # server -> client wallet {m_vecMoney:[type,amount,...]}
 CL_PLAYER_ITEMS  = 0x80070003  # server -> client full inventory (init the bag)
 CL_UPDATE_INFO   = 0x80070004  # server -> client info updates (exp/level/...) {m_vecInfo:[type,val,...]}
+CL_UPDATE_TASK   = 0x80070007  # server -> client quest changes {m_vecUpdateInfo:[{taskId,updType,value}]}
+CL_PLAYER_TASKS  = 0x80070008  # server -> client the player's quests {m_vecTask:[{taskId,state,..}]}

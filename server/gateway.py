@@ -42,6 +42,11 @@ LVEXP_CFG = proto.lua.require("public.staticdata.tb_lvexp")
 MAPMONSTER_CFG = proto.lua.require("public.staticdata.tb_mapmonster")
 MONSTERINFO_CFG = proto.lua.require("public.staticdata.tb_monsterinfo")
 SKILLS_CFG = proto.lua.require("public.staticdata.tb_skills")  # target_num_k = max monster targets
+TASK_CFG = proto.lua.require("public.staticdata.tb_task")      # quest defs: next_task, award, ...
+
+# quest state values (business.txt TASK_STATUS) and update types (UPDATE_TASK)
+TS_CAN_ACCEPT, TS_ACCEPTED, TS_CAN_COMMIT, TS_COMMIT = 2, 3, 4, 5
+UT_STATE, UT_PROGRESS, UT_ADD, UT_DEL = 0x01, 0x02, 0x04, 0x08
 # 战力 weights by attr id, exact from tb_paramter.power (tb_paramter has load-order
 # deps that prevent standalone require). power = floor(sum(weight[id]*value)).
 POWER_WEIGHTS = {1: 9, 2: 18, 3: 1, 4: 66, 5: 83, 6: 50, 7: 66, 8: 25,
@@ -134,7 +139,8 @@ def save_session(s: "Session"):
         return
     c = storage.find_by_pid(s.player_id)
     if c:
-        c.update(level=s.level, exp=s.exp, mapid=s.mapid, x=s.x, y=s.y)
+        c.update(level=s.level, exp=s.exp, mapid=s.mapid, x=s.x, y=s.y,
+                 gold=s.gold, diamond=s.diamond)
         storage.save()
 
 
@@ -166,6 +172,8 @@ class Session:
         self.sex = 1
         self.camp = 1
         self.nickname = "Hero"
+        self.gold = 0
+        self.diamond = 0
         # progression (loaded from storage on enter-world)
         self.level = 1
         self.exp = 0
@@ -302,7 +310,9 @@ async def on_create_player(s: Session, req: dict):
         "sex": int(req.get("m_nSex", 1)),
         "profession": int(req.get("m_nProfession", 2)),
         "camp": 1, "level": 1, "exp": 0,
+        "gold": 1000, "diamond": 100,    # starting funds
         "mapid": 1, "x": 440, "y": 1360, "status": 0,
+        "tasks": {"1": TS_CAN_ACCEPT},   # start with the first quest available
     }
     storage.add_character(account, char)
     log.info("CREATE_PLAYER account=%s '%s' pid=%s prof=%d",
@@ -319,6 +329,7 @@ async def on_login_gateway(s: Session, req: dict):
         s.mapid, s.x, s.y = char["mapid"], char["x"], char["y"]
         s.profession, s.sex, s.camp = char["profession"], char["sex"], char["camp"]
         s.nickname = char["nickname"]
+        s.gold, s.diamond = char.get("gold", 0), char.get("diamond", 0)
     log.info("LOGIN_GATEWAY enter-world pid=%s '%s' lvl=%d map=%d",
              s.player_id, s.nickname, s.level, s.mapid)
     if s.time_task is None:
@@ -341,6 +352,14 @@ async def on_login_gateway(s: Session, req: dict):
         # empty inventory — initializes the bag so the main-view (and skill bar /
         # fight buttons) can finish setting up instead of crashing on pairs(nil)
         "m_vecItem": [], "m_vecEquip": [], "m_vecTreasure": [], "m_vecWarSoul": [],
+    }), (op.CL_PLAYER_MONEY, {
+        "m_vecMoney": [1, s.diamond, 2, s.gold],   # DIAMOND, GOLD
+    }), (op.CL_PLAYER_TASKS, {
+        "m_nRetCode": 0,
+        # only send active quests (omit COMMIT/finished ones so they don't reappear)
+        "m_vecTask": [{"m_nTaskId": int(tid), "m_nState": st,
+                       "m_nProgress": _task_prog(s, tid), "m_nTime": 0}
+                      for tid, st in _char_tasks(s).items() if st != TS_COMMIT],
     })]
 
 
@@ -426,6 +445,7 @@ async def on_attack(s: Session, req: dict):
             tmpl = s.monster_spawns.get(uid)
             if tmpl:
                 total_exp += monster_exp(int(tmpl["m_nMonsterID"]))
+                advance_kill_quests(s, int(tmpl["m_nMonsterID"]))   # quest kill progress
                 itemid = monster_drop(int(tmpl["m_nMonsterID"]))
                 if itemid:
                     s.dropbag_uid += 1
@@ -479,6 +499,133 @@ def grant_exp(s: Session, amount: int):
 async def on_move(s: Session, req: dict):
     s.x, s.y = req.get("x", 0), req.get("y", 0)
     return [(op.GW_PLAYER_MOVE, {"m_nRetCode": 0})]
+
+
+def _char_tasks(s: Session) -> dict:
+    """The character's quest map {taskId(str): state}, defaulting to the first quest."""
+    c = storage.find_by_pid(s.player_id)
+    if c is None:
+        return {}
+    return c.setdefault("tasks", {"1": TS_CAN_ACCEPT})
+
+
+def _task_prog(s: Session, tid) -> int:
+    c = storage.find_by_pid(s.player_id)
+    return int(c.get("task_prog", {}).get(str(tid), 0)) if c else 0
+
+
+def _kill_objective(task_id: int):
+    """If a quest requires killing monsters, return (mapmonster_key, count); else None."""
+    row = TASK_CFG[task_id]
+    if row is None:
+        return None
+    c = row["commit_conds"]
+    try:
+        if c is not None and int(c["type"]) == 1:        # TASK_EVENT.KILL_MON
+            return int(c["mid"]), int(c["count"])
+    except Exception:
+        pass
+    return None
+
+
+def advance_kill_quests(s: Session, killed_key: int):
+    """On a monster kill, progress any accepted kill-quest targeting that monster."""
+    c = storage.find_by_pid(s.player_id)
+    if not c:
+        return
+    tasks = c.get("tasks", {})
+    prog = c.setdefault("task_prog", {})
+    for tid_str, state in list(tasks.items()):
+        if state != TS_ACCEPTED:
+            continue
+        obj = _kill_objective(int(tid_str))
+        if not obj or obj[0] != killed_key:
+            continue
+        need = obj[1]
+        cur = min(prog.get(tid_str, 0) + 1, need)
+        prog[tid_str] = cur
+        updates = [{"m_nTaskId": int(tid_str), "m_nUpdateType": UT_PROGRESS, "m_nValue": cur}]
+        if cur >= need:
+            tasks[tid_str] = TS_CAN_COMMIT
+            updates.append({"m_nTaskId": int(tid_str), "m_nUpdateType": UT_STATE, "m_nValue": TS_CAN_COMMIT})
+            log.info("QUEST %s objective done (%d/%d)", tid_str, cur, need)
+        s.push(op.CL_UPDATE_TASK, {"m_nRetCode": 0, "m_vecUpdateInfo": updates})
+    storage.save()
+
+
+def _give_award(s: Session, task_id: int):
+    """Grant a quest's rewards (tb_task.award = {{type,id,count},..})."""
+    row = TASK_CFG[task_id]
+    if row is None or row["award"] is None:
+        return
+    aw = row["award"]
+    i = 1
+    while aw[i] is not None:
+        a = aw[i]
+        atype, aid, count = int(a["type"]), int(a["id"]), int(a["count"])
+        if atype == 3 and aid == 51:          # OTHER / EXP
+            grant_exp(s, count)
+        elif atype == 2:                       # MONEY (aid = MONEY_TYPE: 1 diamond, 2 gold)
+            grant_money(s, aid, count)
+        # AWARD_TYPE.ITEM(1) -> inventory (next)
+        i += 1
+
+
+def grant_money(s: Session, money_type: int, amount: int):
+    """Add currency and update the client wallet."""
+    if money_type == 1:
+        s.diamond += amount
+    elif money_type == 2:
+        s.gold += amount
+    else:
+        return
+    s.push(op.CL_PLAYER_MONEY, {"m_vecMoney": [money_type,
+            s.diamond if money_type == 1 else s.gold]})
+    save_session(s)
+    log.info("MONEY +%d (type %d) -> gold=%d diamond=%d", amount, money_type, s.gold, s.diamond)
+
+
+@handler(op.GW_TASK_OP)
+async def on_task_op(s: Session, req: dict):
+    op_type = int(req.get("m_nOpType", 0))
+    tid = int(req.get("m_nTaskId", 0))
+    tasks = _char_tasks(s)
+    key = str(tid)
+    if op_type == 1:                                   # accept
+        obj = _kill_objective(tid)
+        if obj:                                        # kill quest -> stay ACCEPTED until done
+            tasks[key] = TS_ACCEPTED
+            c = storage.find_by_pid(s.player_id)
+            if c:
+                c.setdefault("task_prog", {})[key] = 0
+            new_state = TS_ACCEPTED
+        else:                                          # talk quest -> completable now
+            tasks[key] = TS_CAN_COMMIT
+            new_state = TS_CAN_COMMIT
+        s.push(op.CL_UPDATE_TASK, {"m_nRetCode": 0, "m_vecUpdateInfo":
+                [{"m_nTaskId": tid, "m_nUpdateType": UT_STATE, "m_nValue": new_state}]})
+        log.info("QUEST accept %d (state=%d)", tid, new_state)
+    elif op_type == 2:                                 # submit -> reward + advance chain
+        if tasks.get(key) != TS_CAN_COMMIT:            # objective not met yet
+            log.info("QUEST submit %d rejected (state=%s)", tid, tasks.get(key))
+            return [(op.GW_TASK_OP, {"m_nRetCode": 0})]
+        tasks[key] = TS_COMMIT
+        # mark complete, then DEL it so it's removed from the client's quest list
+        s.push(op.CL_UPDATE_TASK, {"m_nRetCode": 0, "m_vecUpdateInfo": [
+            {"m_nTaskId": tid, "m_nUpdateType": UT_STATE, "m_nValue": TS_COMMIT},
+            {"m_nTaskId": tid, "m_nUpdateType": UT_DEL, "m_nValue": 0},
+        ]})
+        _give_award(s, tid)
+        row = TASK_CFG[tid]
+        nxt = int(row["next_task"]) if row is not None and row["next_task"] else 0
+        if nxt > 0 and str(nxt) not in tasks:
+            tasks[str(nxt)] = TS_CAN_ACCEPT
+            # the client ignores UPDATE_TASK.ADD; a new quest must arrive via CL_PLAYER_TASKS
+            s.push(op.CL_PLAYER_TASKS, {"m_nRetCode": 0, "m_vecTask":
+                    [{"m_nTaskId": nxt, "m_nState": TS_CAN_ACCEPT, "m_nProgress": 0, "m_nTime": 0}]})
+        log.info("QUEST submit %d -> next %d", tid, nxt)
+    storage.save()
+    return [(op.GW_TASK_OP, {"m_nRetCode": 0})]
 
 
 @handler(op.GW_PICKUP)
