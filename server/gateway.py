@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import struct
 import time
 import logging
@@ -71,11 +72,18 @@ class Session:
         self.y = 1360
         self.alive = True
         self.time_task = None
+        self.atk = 200                 # player attack (from enter-world attrs)
+        self.monsters: dict[str, int] = {}   # monster uid -> current hp (server-side)
 
     def push(self, opcode: int, fields: dict):
         """Send an unsolicited message to the client (e.g. server-time)."""
         body = proto.encode(opcode, fields, kind="response")
         self.writer.write(HEADER.pack(0, opcode, len(body)) + body)
+
+    def push_aoi(self, events: list[dict]):
+        """Send a CL_AOI push (attack/damage/spawn/del events)."""
+        body = proto.encode_aoi(events)
+        self.writer.write(HEADER.pack(0, op.CL_AOI, len(body)) + body)
 
 
 async def spawn_world(s: Session):
@@ -86,6 +94,8 @@ async def spawn_world(s: Session):
         return
     try:
         events = content.build_map_aoi(proto, s.mapid)
+        # remember each monster's current HP so we can resolve attacks server-side
+        s.monsters = {e["m_nUID"]: e["m_vecAttr"][1] for e in events if e["type"] == 2}
         body = proto.encode_aoi(events)
         s.writer.write(HEADER.pack(0, op.CL_AOI, len(body)) + body)
         await s.writer.drain()
@@ -193,7 +203,9 @@ async def on_login_gateway(s: Session, req: dict):
             108, 2,      # PROFESSION (matches char list)
             109, 1,      # CAMP
         ],
-        "skills": [],
+        # [skillId, level, ...] active skills for profession 2 (201 = basic attack).
+        # Needed or the skill bar never inits and the attack button binds to nothing.
+        "skills": [201, 1, 202, 1, 203, 1, 204, 1, 210, 1, 211, 1],
         "m_strGuildName": "", "m_nGuildID": 0, "m_nGuildJob": 0,
         "m_nExp": 0, "m_nAOISetting": 0, "m_nCreatedTime": 0,
         "m_vecTalent": [], "m_nServerOpen": 0, "m_nUserType": 0,
@@ -216,6 +228,36 @@ async def on_equip_panel(s: Session, req: dict):
 async def on_office(s: Session, req: dict):
     return [(op.GW_OFFICE, {"m_nRetCode": 0, "m_nOpt": req.get("m_nOpt", 1),
                             "m_nLevel": 1, "m_nUsed": 0, "m_nMax": 100})]
+
+
+@handler(op.GW_ATTACK)
+async def on_attack(s: Session, req: dict):
+    target = str(req.get("m_nTarget", 0))
+    skill = int(req.get("m_nSkill", 0))
+    hp = s.monsters.get(target)
+    if hp is None:
+        return [(op.GW_ATTACK, {"m_nRetCode": 0})]   # unknown/dead target, just ack
+
+    crit = random.random() < 0.25
+    dmg = random.randint(int(s.atk * 0.8), int(s.atk * 1.2)) * (2 if crit else 1)
+    hp -= dmg
+    effect = 0x01 | (0x02 if crit else 0)            # HIT (+CRITICAL)
+    dead = hp <= 0
+    if dead:
+        effect |= 0x04                               # DIE
+        s.monsters.pop(target, None)
+    else:
+        s.monsters[target] = hp
+
+    pid = s.player_id or DEMO_PID
+    s.push_aoi([
+        {"type": 9, "m_nAvatarID": pid, "m_nTargetID": target, "m_nSkillID": skill},      # ATTACK
+        {"type": 10, "m_nAvatarID": target, "m_nAttackerID": pid,                          # DAMAGE
+         "m_nEffect": effect, "m_nDamage": dmg, "m_nSkillID": skill},
+    ])
+    log.info("ATTACK target=%s dmg=%d%s hp_left=%d", target, dmg,
+             " CRIT" if crit else "", max(0, hp))
+    return [(op.GW_ATTACK, {"m_nRetCode": 0})]
 
 
 @handler(op.GW_PLAYER_MOVE)
