@@ -1,0 +1,35 @@
+# Copyrighted game material — NEVER commit (legal + GitHub 100MB limit)
+ExportedProject/
+AuxiliaryFiles/
+client/
+*.xapk
+*.apk
+*.obb
+
+# Modified client scripts (derived from the game's copyrighted Lua)
+server/patches/
+
+# Secrets / generated dev certs
+server/*.pem
+server/*.key
+server/*.0
+*.crt
+*.cer
+
+# Transient / local artifacts
+server/*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Screenshots: ignore everywhere except the curated demo set
+*.png
+!docs/screenshots/
+!docs/screenshots/*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
