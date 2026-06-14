@@ -21,6 +21,7 @@ import logging
 from luaproto import LuaProto
 import opcodes as op
 import content
+import storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -90,18 +91,51 @@ def monster_exp(mapmonster_key: int) -> int:
     info = MONSTERINFO_CFG[int(mm["monsterid"])]
     return int(info["exp"]) if info is not None else 0
 
-# ---- toy persistent-ish state (in-memory; M3+ swaps for real storage) ----
-# one demo account -> its characters
-DEMO_PID = "100000000000001"
-ACCOUNTS: dict[str, list[dict]] = {
-    "demo-session": [
-        {
-            "m_nPlayerID": DEMO_PID, "m_nLevel": 12, "m_nSex": 1,
-            "m_nProfession": 2, "m_nCamp": 1, "m_strNickname": "Aragorn",
-            "m_nStatus": 0,
-        }
-    ]
-}
+
+def monster_drop(mapmonster_key: int):
+    """Pick one item id this monster drops (tb_mapmonster.map_drop = {{itemid,count,prob},..})."""
+    mm = MAPMONSTER_CFG[mapmonster_key]
+    if mm is None:
+        return None
+    md = mm["map_drop"]
+    if md is None:
+        return None
+    n = 0
+    while md[n + 1] is not None:
+        n += 1
+    if n == 0:
+        return None
+    return int(md[random.randint(1, n)][1])   # element[1] = itemid (Lua 1-based)
+
+DEMO_PID = "0"   # fallback id only; real characters come from storage
+
+
+def _players_info(c: dict) -> dict:
+    """A character row -> GBM PLAYERS_INFO struct."""
+    return {
+        "m_nPlayerID": str(c["playerid"]), "m_nLevel": c["level"], "m_nSex": c["sex"],
+        "m_nProfession": c["profession"], "m_nCamp": c["camp"],
+        "m_strNickname": c["nickname"], "m_nStatus": c.get("status", 0),
+    }
+
+
+def skills_for(profession: int) -> list:
+    """[skillId, level, ...]: basic attack + the profession's default bar skills
+    (tb_paramter default_skill: prof p -> {p*100+10..+13}, basic = p*100+1)."""
+    s = [profession * 100 + 1, 1]
+    for i in range(10, 14):
+        s += [profession * 100 + i, 1]
+    return s
+
+
+def save_session(s: "Session"):
+    """Persist the live character state (level/exp/map/pos)."""
+    if not s.player_id:
+        return
+    c = storage.find_by_pid(s.player_id)
+    if c:
+        c.update(level=s.level, exp=s.exp, mapid=s.mapid, x=s.x, y=s.y)
+        storage.save()
 
 
 # ---- handler registry: opcode (normalized) -> async fn(session, request)->list[(opcode, fields)] ----
@@ -128,13 +162,19 @@ class Session:
         self.time_task = None
         self.spawn_task = None
         self.atk = 200                 # player attack (from enter-world attrs)
-        # progression (mirrors the enter-world attrs)
-        self.level = 12
+        self.profession = 2
+        self.sex = 1
+        self.camp = 1
+        self.nickname = "Hero"
+        # progression (loaded from storage on enter-world)
+        self.level = 1
         self.exp = 0
         self.power = 5000
         self.maxhp = 10000
         self.monsters: dict[str, int] = {}        # monster uid -> current hp
         self.monster_pos: dict[str, tuple] = {}   # monster uid -> (x, y) network coords
+        self.dropbags: dict[str, int] = {}        # dropbag uid -> itemid (on the ground)
+        self.dropbag_uid = 8000000
         self.monster_spawns: dict[str, dict] = {} # monster uid -> ADD_MONSTER template (for respawn)
         self.monster_reborn: dict[str, int] = {}  # monster uid -> respawn seconds
 
@@ -229,13 +269,13 @@ async def on_regist_user(s: Session, req: dict):
 
 @handler(op.GBM_LOGIN_GAME)
 async def on_login_game(s: Session, req: dict):
-    s.session_id = req.get("m_strSessionID")
-    chars = ACCOUNTS.get(s.session_id) or ACCOUNTS["demo-session"]
-    log.info("LOGIN_GAME session=%s -> %d character(s)", s.session_id, len(chars))
+    s.session_id = req.get("m_strSessionID") or "default"
+    chars = storage.get_characters(s.session_id)
+    log.info("LOGIN_GAME account=%s -> %d character(s)", s.session_id, len(chars))
     return [(op.GBM_LOGIN_GAME, {
         "m_nRetCode": 0,
-        "m_nLastLoginPlayerID": chars[0]["m_nPlayerID"] if chars else "0",
-        "m_vecPlayers": chars,
+        "m_nLastLoginPlayerID": str(chars[-1]["playerid"]) if chars else "0",
+        "m_vecPlayers": [_players_info(c) for c in chars],   # empty -> client shows create screen
     })]
 
 
@@ -255,43 +295,45 @@ async def on_login_player(s: Session, req: dict):
 
 @handler(op.GBM_CREATE_PLAYER)
 async def on_create_player(s: Session, req: dict):
-    # req fields vary; we mirror what the client sent into a new character.
-    name = req.get("m_strNickname") or req.get("name") or "NewHero"
-    chars = ACCOUNTS.setdefault(s.session_id or "demo-session", [])
-    new_pid = str(int(DEMO_PID) + len(chars) + 1)
-    chars.append({
-        "m_nPlayerID": new_pid, "m_nLevel": 1,
-        "m_nSex": req.get("m_nSex", 1), "m_nProfession": req.get("m_nProfession", 1),
-        "m_nCamp": req.get("m_nCamp", 1), "m_strNickname": name, "m_nStatus": 0,
-    })
-    log.info("CREATE_PLAYER name=%s pid=%s", name, new_pid)
-    # respond with the refreshed login/char list shape
-    return [(op.GBM_LOGIN_GAME, {
-        "m_nRetCode": 0, "m_nLastLoginPlayerID": new_pid, "m_vecPlayers": chars,
-    })]
+    account = s.session_id or "default"
+    char = {
+        "playerid": storage.next_playerid(),
+        "nickname": req.get("m_strNickname") or "Hero",
+        "sex": int(req.get("m_nSex", 1)),
+        "profession": int(req.get("m_nProfession", 2)),
+        "camp": 1, "level": 1, "exp": 0,
+        "mapid": 1, "x": 440, "y": 1360, "status": 0,
+    }
+    storage.add_character(account, char)
+    log.info("CREATE_PLAYER account=%s '%s' pid=%s prof=%d",
+             account, char["nickname"], char["playerid"], char["profession"])
+    return [(op.GBM_CREATE_PLAYER, {"m_nRetCode": 0, "m_infoPayer": _players_info(char)})]
 
 
 @handler(op.GW_LOGIN_GATEWAY)
 async def on_login_gateway(s: Session, req: dict):
     s.player_id = str(req.get("m_nPlayerID", DEMO_PID))
-    log.info("LOGIN_GATEWAY enter-world pid=%s", s.player_id)
+    char = storage.find_by_pid(s.player_id)
+    if char:   # load the saved character
+        s.level, s.exp = char["level"], char["exp"]
+        s.mapid, s.x, s.y = char["mapid"], char["x"], char["y"]
+        s.profession, s.sex, s.camp = char["profession"], char["sex"], char["camp"]
+        s.nickname = char["nickname"]
+    log.info("LOGIN_GATEWAY enter-world pid=%s '%s' lvl=%d map=%d",
+             s.player_id, s.nickname, s.level, s.mapid)
     if s.time_task is None:
         s.time_task = asyncio.create_task(time_pusher(s))
     _start_spawn(s)                       # populate the map a few seconds after entry
-    # minimal valid enter-world snapshot; spawn at map 1, tile (100,100).
+    # base attrs but with the character's own profession/sex/camp
+    attrs = [(aid, v) for (aid, v) in PLAYER_BASE_ATTRS
+             if aid not in (102, 108, 109)] + [(102, s.sex), (108, s.profession), (109, s.camp)]
     return [(op.GW_LOGIN_GATEWAY, {
         "m_nRetCode": 0,
         "playerid": s.player_id,
-        "nickname": "Aragorn",
-        # network coord = world coord * 10 (GetTransPosUp). Map 1 "Sunrise Village"
-        # spawn (tb_map.enter) is world (x=44, z=136) -> network (440, 1360).
-        "mapid": 1, "x": 440, "y": 1360,
-        # flat [attrId, value, ...]: base attrs + LEVEL + the REAL computed POWER
-        "m_vecAttr": _flatten(PLAYER_BASE_ATTRS)
-                     + [101, s.level, 104, compute_power(PLAYER_BASE_ATTRS)],
-        # [skillId, level, ...] active skills for profession 2 (201 = basic attack).
-        # Needed or the skill bar never inits and the attack button binds to nothing.
-        "skills": [201, 1, 202, 1, 203, 1, 204, 1, 210, 1, 211, 1],
+        "nickname": s.nickname,
+        "mapid": s.mapid, "x": s.x, "y": s.y,    # spawn where the character logged out
+        "m_vecAttr": _flatten(attrs) + [101, s.level, 104, compute_power(attrs)],
+        "skills": skills_for(s.profession),       # the character's profession skills
         "m_strGuildName": "", "m_nGuildID": 0, "m_nGuildJob": 0,
         "m_nExp": 0, "m_nAOISetting": 0, "m_nCreatedTime": 0,
         "m_vecTalent": [], "m_nServerOpen": 0, "m_nUserType": 0,
@@ -333,22 +375,27 @@ def _skill_targets(s: Session, target: str) -> int:
 
 
 def _pick_victims(s: Session, target: str, cap: int) -> list:
-    """Target first, then the nearest live monsters within AOE_RADIUS, up to cap."""
-    victims = [target] if target in s.monsters else []
-    if cap > 1 and target in s.monster_pos:
+    """Pick up to `cap` live monsters. If a monster is targeted, center on it;
+    otherwise (a skill fired with no lock) center on the player and hit nearby
+    monsters — that's why skills now deal damage, not just basic attacks."""
+    if target in s.monsters and target in s.monster_pos:
         cx, cy = s.monster_pos[target]
-        near = []
-        for uid, (x, y) in s.monster_pos.items():
-            if uid == target or uid not in s.monsters:
-                continue
-            d2 = (x - cx) ** 2 + (y - cy) ** 2
-            if d2 <= AOE_RADIUS ** 2:
-                near.append((d2, uid))
-        near.sort()
-        for _, uid in near:
-            if len(victims) >= cap:
-                break
-            victims.append(uid)
+        victims = [target]
+    else:
+        cx, cy = s.x, s.y                      # no locked target -> AoE around the player
+        victims = []
+    near = []
+    for uid, (x, y) in s.monster_pos.items():
+        if uid in victims or uid not in s.monsters:
+            continue
+        d2 = (x - cx) ** 2 + (y - cy) ** 2
+        if d2 <= AOE_RADIUS ** 2:
+            near.append((d2, uid))
+    near.sort()
+    for _, uid in near:
+        if len(victims) >= cap:
+            break
+        victims.append(uid)
     return victims
 
 
@@ -356,13 +403,13 @@ def _pick_victims(s: Session, target: str, cap: int) -> list:
 async def on_attack(s: Session, req: dict):
     target = str(req.get("m_nTarget", 0))
     skill = int(req.get("m_nSkill", 0))
-    if target not in s.monsters:
-        return [(op.GW_ATTACK, {"m_nRetCode": 0})]   # unknown/dead target, just ack
-
     pid = s.player_id or DEMO_PID
     cap = _skill_targets(s, skill)                   # area skills hit several monsters
     victims = _pick_victims(s, target, cap)
-    events = [{"type": 9, "m_nAvatarID": pid, "m_nTargetID": target, "m_nSkillID": skill}]  # ATTACK anim
+    if not victims:
+        return [(op.GW_ATTACK, {"m_nRetCode": 0})]   # nothing in range, just ack
+    anim_target = target if target in s.monsters else victims[0]
+    events = [{"type": 9, "m_nAvatarID": pid, "m_nTargetID": anim_target, "m_nSkillID": skill}]  # ATTACK anim
     total_exp = 0
     for uid in victims:
         hp = s.monsters.get(uid)
@@ -379,6 +426,14 @@ async def on_attack(s: Session, req: dict):
             tmpl = s.monster_spawns.get(uid)
             if tmpl:
                 total_exp += monster_exp(int(tmpl["m_nMonsterID"]))
+                itemid = monster_drop(int(tmpl["m_nMonsterID"]))
+                if itemid:
+                    s.dropbag_uid += 1
+                    duid = str(s.dropbag_uid)
+                    dx, dy = s.monster_pos.get(uid, (s.x, s.y))
+                    s.dropbags[duid] = itemid
+                    events.append({"type": 5, "m_nUID": duid, "m_nItemID": itemid,
+                                   "x": dx, "y": dy})   # ADD_DROPBAG
             s.monsters.pop(uid, None)
             asyncio.create_task(kill_and_respawn(s, uid))
         else:
@@ -417,12 +472,23 @@ def grant_exp(s: Session, amount: int):
         s.push_aoi([{"type": 11, "m_nAvatarID": s.player_id or DEMO_PID,
                      "m_vecAttr": [101, s.level]}])   # update LEVEL on the HUD
         log.info("LEVEL UP -> %d (exp left %d)", s.level, s.exp)
+    save_session(s)
 
 
 @handler(op.GW_PLAYER_MOVE)
 async def on_move(s: Session, req: dict):
     s.x, s.y = req.get("x", 0), req.get("y", 0)
     return [(op.GW_PLAYER_MOVE, {"m_nRetCode": 0})]
+
+
+@handler(op.GW_PICKUP)
+async def on_pickup(s: Session, req: dict):
+    duid = str(req.get("m_nDropbagID", 0))
+    if duid in s.dropbags:
+        s.dropbags.pop(duid, None)
+        s.push_aoi([{"type": 13, "m_nUID": duid, "m_nVestID": "0"}])  # DEL_DROPBAG
+        log.info("PICKUP dropbag %s", duid)
+    return [(op.GW_PICKUP, {"m_nRetCode": 0})]
 
 
 @handler(op.GW_TELEPORT)
@@ -438,6 +504,7 @@ async def on_teleport(s: Session, req: dict):
     s.mapid, s.x, s.y = to_map, to_x * 10, to_z * 10   # network coord = world*10
     # drop the old map's monster state; the new map gets repopulated after it loads
     s.monsters.clear(); s.monster_spawns.clear(); s.monster_pos.clear()
+    save_session(s)                                     # persist the new map/position
     log.info("TELEPORT id=%d -> map %d at world(%d,%d)", tid, to_map, to_x, to_z)
     _start_spawn(s)                       # populate the destination map's monsters
     return [(op.GW_TELEPORT, {"m_nRetCode": 0, "m_nMapID": to_map, "x": s.x, "y": s.y})]
@@ -497,6 +564,7 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         log.exception("connection error: %s", e)
     finally:
         s.alive = False
+        save_session(s)               # persist level/exp/map/position on disconnect
         if s.time_task:
             s.time_task.cancel()
         writer.close()

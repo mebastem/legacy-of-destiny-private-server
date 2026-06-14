@@ -33,3 +33,6 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# Player save data (local)
+server/accounts.json

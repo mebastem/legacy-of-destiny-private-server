@@ -18,6 +18,7 @@ GW_PLAYER_MOVE   = 0x00050002
 GW_TELEPORT      = 0x00050004  # portal teleport: req {type,teleportID,targetID} -> {ret,mapid,x,y}
 GW_TELEPORT_FINISH = 0x00050005  # client signals teleport done (cm_empty)
 GW_ATTACK        = 0x00050006
+GW_PICKUP        = 0x00050007  # pick up a dropped item: req {m_nDropbagID}
 GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
