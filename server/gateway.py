@@ -73,7 +73,9 @@ class Session:
         self.alive = True
         self.time_task = None
         self.atk = 200                 # player attack (from enter-world attrs)
-        self.monsters: dict[str, int] = {}   # monster uid -> current hp (server-side)
+        self.monsters: dict[str, int] = {}        # monster uid -> current hp
+        self.monster_spawns: dict[str, dict] = {} # monster uid -> ADD_MONSTER template (for respawn)
+        self.monster_reborn: dict[str, int] = {}  # monster uid -> respawn seconds
 
     def push(self, opcode: int, fields: dict):
         """Send an unsolicited message to the client (e.g. server-time)."""
@@ -93,9 +95,11 @@ async def spawn_world(s: Session):
     if not s.alive:
         return
     try:
-        events = content.build_map_aoi(proto, s.mapid)
-        # remember each monster's current HP so we can resolve attacks server-side
+        events, reborn = content.build_map_aoi(proto, s.mapid)
+        # remember each monster's HP + spawn template so attacks/respawns work
         s.monsters = {e["m_nUID"]: e["m_vecAttr"][1] for e in events if e["type"] == 2}
+        s.monster_spawns = {e["m_nUID"]: e for e in events if e["type"] == 2}
+        s.monster_reborn = reborn
         body = proto.encode_aoi(events)
         s.writer.write(HEADER.pack(0, op.CL_AOI, len(body)) + body)
         await s.writer.drain()
@@ -108,6 +112,30 @@ async def spawn_world(s: Session):
         pass
     except Exception as e:
         log.exception("spawn_world failed: %s", e)
+
+
+async def kill_and_respawn(s: Session, uid: str):
+    """Remove a dead monster after its death animation, then respawn it at its
+    spawn point after the configured reborn time (cycle spawning)."""
+    template = s.monster_spawns.get(uid)
+    reborn = s.monster_reborn.get(uid, 8)
+    try:
+        await asyncio.sleep(1.5)                       # let the death animation play
+        if not s.alive:
+            return
+        s.push_aoi([{"type": 7, "m_nAvatarID": uid}])  # AOI_DEL -> corpse disappears
+        await s.writer.drain()
+        if template is None:
+            return
+        await asyncio.sleep(reborn)                    # respawn delay
+        if not s.alive:
+            return
+        s.monsters[uid] = template["m_vecAttr"][1]      # restore full HP
+        s.push_aoi([template])                          # re-spawn at its born point
+        await s.writer.drain()
+        log.info("respawned monster %s after %ds", uid, reborn)
+    except (ConnectionError, asyncio.CancelledError):
+        pass
 
 
 async def time_pusher(s: Session):
@@ -209,6 +237,10 @@ async def on_login_gateway(s: Session, req: dict):
         "m_strGuildName": "", "m_nGuildID": 0, "m_nGuildJob": 0,
         "m_nExp": 0, "m_nAOISetting": 0, "m_nCreatedTime": 0,
         "m_vecTalent": [], "m_nServerOpen": 0, "m_nUserType": 0,
+    }), (op.CL_PLAYER_ITEMS, {
+        # empty inventory — initializes the bag so the main-view (and skill bar /
+        # fight buttons) can finish setting up instead of crashing on pairs(nil)
+        "m_vecItem": [], "m_vecEquip": [], "m_vecTreasure": [], "m_vecWarSoul": [],
     })]
 
 
@@ -246,6 +278,7 @@ async def on_attack(s: Session, req: dict):
     if dead:
         effect |= 0x04                               # DIE
         s.monsters.pop(target, None)
+        asyncio.create_task(kill_and_respawn(s, target))   # despawn + respawn cycle
     else:
         s.monsters[target] = hp
 

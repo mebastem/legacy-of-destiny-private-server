@@ -12,6 +12,7 @@ from __future__ import annotations
 # how many monsters to actually spawn per spawn-point (configs say up to ~25;
 # cap so the emulator isn't flooded while still showing every spawn location)
 MONSTERS_PER_POINT = 4
+MIN_RESPAWN_SECONDS = 5   # floor so config reborn_time=1 doesn't respawn instantly
 
 
 def _iter(tbl):
@@ -29,6 +30,7 @@ def build_map_aoi(proto, mapid: int) -> list[dict]:
     mi = proto.lua.require("public.staticdata.tb_monsterinfo")
 
     events: list[dict] = []
+    reborn: dict[str, int] = {}   # monster uid -> respawn seconds
     uid = 900000
 
     # --- monsters: each tb_mapmonster spawn point on this map ---
@@ -41,6 +43,7 @@ def build_map_aoi(proto, mapid: int) -> list[dict]:
         bx, bz = int(e["born_x"]), int(e["born_z"])
         radius = int(e["born_radius"] or 1)
         count = min(int(e["count"] or 1), MONSTERS_PER_POINT)
+        rb = max(int(e["reborn_time"] or 1), MIN_RESPAWN_SECONDS)
         attr = [int(info["hp"]), int(info["hp"]), int(info["level"]),
                 int(info["speed"]), 0]  # MAXHP, HP, LEVEL, SPEED, CAMP
         step = max(1, radius // 2)
@@ -53,6 +56,7 @@ def build_map_aoi(proto, mapid: int) -> list[dict]:
                 "m_nUID": str(uid), "m_nMonsterID": int(key),
                 "x": (bx + ox) * 10, "y": (bz + oz) * 10, "m_vecAttr": attr,
             })
+            reborn[str(uid)] = rb
 
     # --- NPCs: client positions them from config.npc[npcid] ---
     for npcid, e in _iter(npc):
@@ -75,13 +79,13 @@ def build_map_aoi(proto, mapid: int) -> list[dict]:
             })
             i += 1
 
-    return events
+    return events, reborn
 
 
 if __name__ == "__main__":
     from luaproto import LuaProto
     p = LuaProto()
-    evs = build_map_aoi(p, 1)
+    evs, reborn = build_map_aoi(p, 1)
     by_type = {}
     for e in evs:
         by_type[e["type"]] = by_type.get(e["type"], 0) + 1
