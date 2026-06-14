@@ -408,6 +408,14 @@ async def on_equip_panel(s: Session, req: dict):
                                  "m_nIndex": req.get("m_nIndex", 0)})]
 
 
+@handler(op.GW_EQUIP_INFO)
+async def on_equip_info(s: Session, req: dict):
+    # Enhancement panel (strengthen/refine/gem/enchant/polish/star) data per part.
+    # Base gear has no enhancements, so every vector is empty — this just populates
+    # the panel's source table so it doesn't crash on nil (biz_equipment_main:297).
+    return [(op.GW_EQUIP_INFO, {})]
+
+
 @handler(op.GW_OFFICE)
 async def on_office(s: Session, req: dict):
     return [(op.GW_OFFICE, {"m_nRetCode": 0, "m_nOpt": req.get("m_nOpt", 1),

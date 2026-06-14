@@ -36,9 +36,9 @@ def _write_item(b: CByteBuffer, uid, itemid, count, bag, is_equip):
     b.WriteByte(0)            # status
     b.WriteUInt(0)            # validtime
     if is_equip:              # equipment carries dynamic-attr tables (empty for base gear)
-        b.WriteString("{}")
-        b.WriteString("{}")
-        b.WriteString("{}")
+        b.WriteString("{}")   # xlattr (wash attrs)
+        b.WriteString("{}")   # randxlattr
+        b.WriteString("{}")   # data
 
 
 def encode_add(uid, itemid, count, bag, is_equip) -> bytes:

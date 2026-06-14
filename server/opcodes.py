@@ -23,6 +23,7 @@ GW_TASK_OP       = 0x00050012  # quest accept/submit: req {m_nOpType(1=accept,2=
 GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
+GW_EQUIP_INFO    = 0x0005001D  # equip enhancement state (strong/refine/gem/magic/polish/star), empty req
 GW_EQUIP_WEAR    = 0x0005001E  # equip/unequip: req {m_nOpt(1=wear,2=remove), m_nUniqueID}
 GW_EQUIP_PANEL   = 0x00050024  # equip panel query {atk,def,hp,index}
 GW_OFFICE        = 0x0005002E  # military rank/office {ret,opt,level,used,max}
