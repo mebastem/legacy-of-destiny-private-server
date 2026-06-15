@@ -16,6 +16,7 @@ from codec import CByteBuffer
 # ITEM_POS (where an item lives) — this is the item's `bag` field used for routing
 POS_BAG, POS_EQUIP, POS_TREASURE, POS_WARSOUL = 1, 2, 4, 5
 UPDATE_ITEM_ADD = 0x1000   # UPDATE_ITEM.ADD
+UPDATE_ITEM_COUNT = 0x0002 # UPDATE_ITEM.COUNT (m_Value = new absolute count, u32)
 
 
 def pos_for(item_type: int, worn: bool = False) -> int:
@@ -41,6 +42,44 @@ def _write_item(b: CByteBuffer, uid, itemid, count, bag, is_equip):
         b.WriteString("{}")   # data
 
 
+EQUIP_PART_COUNT = 10   # EQUIP_PART WEAPON..RING (tb_equip_strong has parts 1..10)
+
+
+def encode_equip_info(parts: int = EQUIP_PART_COUNT) -> bytes:
+    """GW_EQUIP_INFO body: per-part enhancement state (strengthen/refine/gem/magic/
+    polish/star). Base gear is all zeros, but every vector needs one struct PER equip
+    part or the forge/equip panel nil-crashes — e.g. CountStren does
+    GetPartPerData(1,part).m_nLevel, so m_vecStrong[part] must exist.
+    Wire order (see public/netimpl/gateway/gw_equip_info.txt): Strong, Refine, Gem,
+    Magic, MagicActive, Polish, Star."""
+    b = CByteBuffer()
+    b.WriteSize(parts)                              # m_vecStrong: STRONG_INFO{lvl u8, prog u16}
+    for _ in range(parts):
+        b.WriteByte(0); b.WriteUShort(0)
+    b.WriteSize(parts)                              # m_vecRefine: STRONG_INFO
+    for _ in range(parts):
+        b.WriteByte(0); b.WriteUShort(0)
+    b.WriteSize(parts)                              # m_vecGem: GEM_INFO{gem1..5 u32}
+    for _ in range(parts):
+        for _ in range(5):
+            b.WriteUInt(0)
+    b.WriteSize(parts)                              # m_vecMagic: u8 per part
+    for _ in range(parts):
+        b.WriteByte(0)
+    b.WriteSize(parts)                              # m_vecMagicActive: u8 per part
+    for _ in range(parts):
+        b.WriteByte(0)
+    b.WriteSize(parts)                              # m_vecPolish: u16 per part
+    for _ in range(parts):
+        b.WriteUShort(0)
+    b.WriteSize(parts)                              # m_vecStar: STAR_LEVEL_INFO{count u16, lvl u8, star1..5 u8}
+    for _ in range(parts):
+        b.WriteUShort(0)
+        for _ in range(6):
+            b.WriteByte(0)
+    return b.ToBytes()
+
+
 def encode_add(uid, itemid, count, bag, is_equip) -> bytes:
     """One CL_UPDATE_ITEMS body that adds a single item to the bag."""
     b = CByteBuffer()
@@ -48,4 +87,14 @@ def encode_add(uid, itemid, count, bag, is_equip) -> bytes:
     b.WriteULong(str(uid))               # updateitem.m_nUniqueID
     b.WriteUShort(UPDATE_ITEM_ADD)       # updateitem.m_nUpdateType
     _write_item(b, uid, itemid, count, bag, is_equip)
+    return b.ToBytes()
+
+
+def encode_count(uid, new_count) -> bytes:
+    """One CL_UPDATE_ITEMS body that sets an existing item's stack count (for stacking)."""
+    b = CByteBuffer()
+    b.WriteSize(1)                       # m_vecUpdateInfo count
+    b.WriteULong(str(uid))               # updateitem.m_nUniqueID
+    b.WriteUShort(UPDATE_ITEM_COUNT)     # updateitem.m_nUpdateType
+    b.WriteUInt(int(new_count))          # m_Value = new absolute count
     return b.ToBytes()

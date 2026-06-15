@@ -42,6 +42,11 @@ def get_characters(account: str) -> list:
     return _data.get(account, [])
 
 
+def all_characters() -> list:
+    """Every created character across all accounts (for server-wide rankings)."""
+    return [c for chars in _data.values() for c in chars]
+
+
 def find_by_pid(pid) -> dict | None:
     pid = str(pid)
     for chars in _data.values():

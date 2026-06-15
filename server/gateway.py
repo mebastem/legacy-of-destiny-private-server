@@ -23,6 +23,7 @@ import opcodes as op
 import content
 import storage
 import items
+import ranking
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gateway")
@@ -101,6 +102,23 @@ def total_power(s: Session) -> int:
     p = compute_power(player_attrs(s))
     c = storage.find_by_pid(s.player_id)
     for itemid in (c.get("equipped", {}).values() if c else []):
+        row = TB_ITEM[int(itemid)]
+        if row is not None and row["effect_value"] is not None:
+            p += int(row["effect_value"]["score"] or 0)
+    return p
+
+
+_BASE_POWER = None   # base attribute power is the same for every character (cached)
+
+
+def char_power(c: dict) -> int:
+    """战力 for a stored character: constant base power + equipped gear scores."""
+    global _BASE_POWER
+    if _BASE_POWER is None:
+        _BASE_POWER = compute_power([(aid, v) for (aid, v) in PLAYER_BASE_ATTRS
+                                     if aid not in (102, 108, 109)])
+    p = _BASE_POWER
+    for itemid in c.get("equipped", {}).values():
         row = TB_ITEM[int(itemid)]
         if row is not None and row["effect_value"] is not None:
             p += int(row["effect_value"]["score"] or 0)
@@ -363,11 +381,14 @@ async def on_login_gateway(s: Session, req: dict):
         s.profession, s.sex, s.camp = char["profession"], char["sex"], char["camp"]
         s.nickname = char["nickname"]
         s.gold, s.diamond = char.get("gold", 0), char.get("diamond", 0)
+        # continue item uids past the saved ones so new pickups never reuse an id
+        s.item_uid = max([s.item_uid] + [int(it["uid"]) for it in char.get("items", [])])
     log.info("LOGIN_GATEWAY enter-world pid=%s '%s' lvl=%d map=%d",
              s.player_id, s.nickname, s.level, s.mapid)
     if s.time_task is None:
         s.time_task = asyncio.create_task(time_pusher(s))
     _start_spawn(s)                       # populate the map a few seconds after entry
+    push_equip_info(s)                    # seed equip-enhancement state so the forge/equip panel won't nil-crash
     return [(op.GW_LOGIN_GATEWAY, {
         "m_nRetCode": 0,
         "playerid": s.player_id,
@@ -408,18 +429,51 @@ async def on_equip_panel(s: Session, req: dict):
                                  "m_nIndex": req.get("m_nIndex", 0)})]
 
 
-@handler(op.GW_EQUIP_INFO)
-async def on_equip_info(s: Session, req: dict):
-    # Enhancement panel (strengthen/refine/gem/enchant/polish/star) data per part.
-    # Base gear has no enhancements, so every vector is empty — this just populates
-    # the panel's source table so it doesn't crash on nil (biz_equipment_main:297).
-    return [(op.GW_EQUIP_INFO, {})]
+def push_equip_info(s: Session):
+    # The client never *requests* GW_EQUIP_INFO (it only listens); the server pushes
+    # it. It sets m_partInfo, which the forge/equip panel reads per equip part — if
+    # it's nil the panel/forge nil-crashes (biz_equipment_main:285 GetPartInfosList,
+    # via biz_forge_dot.CountStren on the first attr/level update). All-zero (base
+    # gear has no enhancements), one struct per part so indexing never hits nil.
+    body = items.encode_equip_info()
+    s.writer.write(HEADER.pack(0, op.GW_EQUIP_INFO, len(body)) + body)
 
 
 @handler(op.GW_OFFICE)
 async def on_office(s: Session, req: dict):
     return [(op.GW_OFFICE, {"m_nRetCode": 0, "m_nOpt": req.get("m_nOpt", 1),
                             "m_nLevel": 1, "m_nUsed": 0, "m_nMax": 100})]
+
+
+RANK_PAGE_SIZE = 10
+
+
+@handler(op.GW_QUERY_RANKING)
+async def on_query_ranking(s: Session, req: dict):
+    """Server-wide leaderboard. The power (fight) and level boards show real data from
+    all created characters; other boards return a valid empty list of the right type."""
+    name = req.get("m_strRankingName", "fight_ranking") or "fight_ranking"
+    page = int(req.get("m_nPage", 0))
+    entries = []
+    if ranking.kind_of(name) == "NORMAL":                # power/level/etc share NORMAL_INFO
+        chars = storage.all_characters()
+        if name == "level_ranking":
+            chars.sort(key=lambda c: (int(c.get("level", 1)), char_power(c)), reverse=True)
+        else:                                            # fight_ranking + other power boards
+            chars.sort(key=char_power, reverse=True)
+        entries = [{"playerid": c["playerid"], "power": char_power(c),
+                    "name": c.get("nickname", ""), "level": int(c.get("level", 1)),
+                    "vip": 0, "guild": ""} for c in chars]
+    max_page = ((len(entries) - 1) // RANK_PAGE_SIZE) if entries else 0
+    page_entries = entries[page * RANK_PAGE_SIZE: page * RANK_PAGE_SIZE + RANK_PAGE_SIZE]
+    my = next((i for i, e in enumerate(entries) if str(e["playerid"]) == str(s.player_id)), -1)
+    my_info = entries[my] if my >= 0 else {
+        "playerid": s.player_id, "power": total_power(s), "name": s.nickname,
+        "level": s.level, "vip": 0, "guild": ""}
+    body = ranking.encode(name, page, my + 1 if my >= 0 else 0, my_info, page_entries, max_page)
+    s.writer.write(HEADER.pack(0, op.GW_QUERY_RANKING, len(body)) + body)
+    log.info("RANKING %s page=%d -> %d entries (me #%d)", name, page, len(page_entries), my + 1)
+    return []
 
 
 AOE_RADIUS = 60   # network units (~6m) for picking nearby monsters in a skill's area
@@ -492,7 +546,7 @@ async def on_attack(s: Session, req: dict):
                     s.dropbag_uid += 1
                     duid = str(s.dropbag_uid)
                     dx, dy = s.monster_pos.get(uid, (s.x, s.y))
-                    s.dropbags[duid] = itemid
+                    s.dropbags[duid] = (itemid, dx, dy)   # keep pos for proximity pickup
                     events.append({"type": 5, "m_nUID": duid, "m_nItemID": itemid,
                                    "x": dx, "y": dy})   # ADD_DROPBAG
             s.monsters.pop(uid, None)
@@ -536,9 +590,28 @@ def grant_exp(s: Session, amount: int):
     save_session(s)
 
 
+PICKUP_RADIUS = 50   # network units (~5m): drops the player walks over are auto-collected
+
+
+def _auto_pickup(s: Session):
+    """Server-side loot pickup. The client never sends a pickup request (drops can't be
+    selected; GW_PICKUP is vestigial) — instead the server grants any drop the player
+    walks near and tells the client to remove the bag (DEL_DROPBAG)."""
+    if not s.dropbags:
+        return
+    px, py = s.x, s.y
+    for duid, (itemid, dx, dy) in list(s.dropbags.items()):
+        if (px - dx) ** 2 + (py - dy) ** 2 <= PICKUP_RADIUS ** 2:
+            s.dropbags.pop(duid, None)
+            s.push_aoi([{"type": 13, "m_nAvatarID": duid, "m_nVestID": 0}])  # DEL_DROPBAG
+            give_item(s, int(itemid), 1, auto_equip=False)                   # loot -> bag
+            log.info("AUTO-PICKUP dropbag %s -> item %s", duid, itemid)
+
+
 @handler(op.GW_PLAYER_MOVE)
 async def on_move(s: Session, req: dict):
     s.x, s.y = req.get("x", 0), req.get("y", 0)
+    _auto_pickup(s)
     return [(op.GW_PLAYER_MOVE, {"m_nRetCode": 0})]
 
 
@@ -613,19 +686,35 @@ def _give_award(s: Session, task_id: int):
         i += 1
 
 
-def give_item(s: Session, itemid: int, count: int = 1):
-    """Add an item to the player (persisted) and push it. Equipment auto-equips to
-    the worn slot (so it shows on the gear panel, not just the bag)."""
+def give_item(s: Session, itemid: int, count: int = 1, auto_equip: bool = True):
+    """Add an item to the player (persisted) and push it. By default equipment goes
+    straight onto the character (worn slot); pass auto_equip=False (e.g. looted drops)
+    to drop it into the bag so the player can equip it manually."""
     row = TB_ITEM[itemid]
     if row is None:
         return
     itype = int(row["item_type"])
     is_equip = itype == 3
-    worn = is_equip                              # gear goes straight onto the character
+    worn = is_equip and auto_equip               # gear onto the character unless bag-only
     pos = items.pos_for(itype, worn)             # ITEM_POS routing value
+    c = storage.find_by_pid(s.player_id)
+    try:
+        stack_max = int(row["group_size"] or 1)  # tb_item.group_size = max stack size
+    except Exception:
+        stack_max = 1
+    # Stack onto an existing identical bag stack instead of taking a new cell.
+    if not is_equip and pos == items.POS_BAG and stack_max > 1 and c is not None:
+        for it in c.get("items", []):
+            if (it["itemid"] == int(itemid) and it.get("bag") == items.POS_BAG
+                    and it["count"] + count <= stack_max):
+                it["count"] += int(count)
+                storage.save()
+                body = items.encode_count(it["uid"], it["count"])
+                s.writer.write(HEADER.pack(0, op.CL_UPDATE_ITEMS, len(body)) + body)
+                log.info("ITEM stack +%d x%d -> count %d (uid %s)", itemid, count, it["count"], it["uid"])
+                return
     s.item_uid += 1
     uid = s.item_uid
-    c = storage.find_by_pid(s.player_id)
     if c is not None:
         c.setdefault("items", []).append(
             {"uid": uid, "itemid": int(itemid), "count": int(count), "bag": pos})
@@ -720,11 +809,14 @@ async def on_equip_wear(s: Session, req: dict):
 
 @handler(op.GW_PICKUP)
 async def on_pickup(s: Session, req: dict):
+    # Vestigial: the client doesn't actually send this (pickup is server-side via
+    # _auto_pickup on move). Kept for completeness in case a request ever arrives.
     duid = str(req.get("m_nDropbagID", 0))
     if duid in s.dropbags:
-        s.dropbags.pop(duid, None)
-        s.push_aoi([{"type": 13, "m_nUID": duid, "m_nVestID": "0"}])  # DEL_DROPBAG
-        log.info("PICKUP dropbag %s", duid)
+        itemid = s.dropbags.pop(duid)[0]
+        s.push_aoi([{"type": 13, "m_nAvatarID": duid, "m_nVestID": 0}])  # DEL_DROPBAG
+        give_item(s, int(itemid), 1, auto_equip=False)                  # loot lands in the bag
+        log.info("PICKUP dropbag %s -> item %s", duid, itemid)
     return [(op.GW_PICKUP, {"m_nRetCode": 0})]
 
 
