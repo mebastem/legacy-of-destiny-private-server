@@ -24,6 +24,10 @@ GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
 GW_QUERY_RANKING = 0x00050027  # query a leaderboard: req {m_strRankingName, m_nPage} -> ranked list
+GW_SHOW_OPT      = 0x00050030  # attire tier op: req {m_nOpt(1=bless,2=quality,4=activate,5=mount), m_nID, m_nLevel}
+GW_SHOW_QUERY    = 0x00050031  # attire page query (no payload) -> {m_strName, m_vecInfo:[SHOW_INFO]}
+GW_SHOW_FIGURE_OPT   = 0x0005006C  # attire op: req {m_nOpt(1=activate,2=star,3=display), genre, showID, figureID}
+GW_SHOW_FIGURE_QUERY = 0x0005006D  # attire query: req {m_nGenre, m_nShowID} -> current illusion + stars
 GW_EQUIP_INFO    = 0x0005001D  # equip enhancement state (strong/refine/gem/magic/polish/star), empty req
 GW_EQUIP_WEAR    = 0x0005001E  # equip/unequip: req {m_nOpt(1=wear,2=remove), m_nUniqueID}
 GW_EQUIP_PANEL   = 0x00050024  # equip panel query {atk,def,hp,index}

@@ -19,6 +19,7 @@ import time
 import logging
 
 from luaproto import LuaProto
+from codec import CByteBuffer
 import opcodes as op
 import content
 import storage
@@ -46,6 +47,9 @@ MONSTERINFO_CFG = proto.lua.require("public.staticdata.tb_monsterinfo")
 SKILLS_CFG = proto.lua.require("public.staticdata.tb_skills")  # target_num_k = max monster targets
 TASK_CFG = proto.lua.require("public.staticdata.tb_task")      # quest defs: next_task, award, ...
 TB_ITEM = proto.lua.require("public.staticdata.tb_item")       # item defs: item_type, ...
+SHOW_FIGURE_CFG = proto.lua.require("public.staticdata.tb_show_figure")  # attire illusion: key (showID<<8)+figureID
+SHOW_CFG = proto.lua.require("public.staticdata.tb_show")        # attire tiers: [showID][tier] -> attr,bless,quality,figure
+SHOW_EXT_CFG = proto.lua.require("public.staticdata.tb_show_ext")  # per attire type: bless_attr, quality_attr, ...
 
 # quest state values (business.txt TASK_STATUS) and update types (UPDATE_TASK)
 TS_CAN_ACCEPT, TS_ACCEPTED, TS_CAN_COMMIT, TS_COMMIT = 2, 3, 4, 5
@@ -123,6 +127,61 @@ def char_power(c: dict) -> int:
         if row is not None and row["effect_value"] is not None:
             p += int(row["effect_value"]["score"] or 0)
     return p
+
+
+def char_figure1(c: dict) -> int:
+    """Pack the character's displayed attire into FIGURE1 (ATTR 151). Bytes low->high:
+    weapon(showID 1), mount(2), wings(3), magic-armor(4); each byte = displayed figure id."""
+    f = 0
+    for sid_str, fid in (c.get("figures", {}) if c else {}).items():
+        f |= (int(fid) & 0xFF) << ((int(sid_str) - 1) * 8)
+    return f
+
+
+ATTIRE_BOARDS = {"weapon_ranking": 1, "mounts_ranking": 2,
+                 "wing_ranking": 3, "armor_ranking": 4}   # ranking name -> SHOW_ID
+
+
+ATTIRE_TYPES = (1, 2, 3, 4)        # SHOW_ID weapon, mount, wing, armor
+ATTIRE_MAX_TIER = 10
+
+
+def attire_state(c: dict, show_id: int) -> dict:
+    """The character's tier/bless/quality for one attire slot (defaults to tier 1)."""
+    ext = (c.get("exterior", {}) if c else {}).get(str(show_id))
+    if not ext:
+        return {"level": 1, "bless": 0, "quality": 0}
+    return {"level": int(ext.get("level", 1)), "bless": int(ext.get("bless", 0)),
+            "quality": int(ext.get("quality", 0))}
+
+
+def _attr_pairs(attr) -> list:
+    """A flat lua attr table {id,val,id,val,...} -> [(id,val),...]."""
+    pairs, i = [], 1
+    while attr is not None and attr[i] is not None and attr[i + 1] is not None:
+        pairs.append((int(attr[i]), int(attr[i + 1])))
+        i += 2
+    return pairs
+
+
+def attire_power(c: dict, show_id: int) -> int:
+    """战力 from a slot's attire: cumulative real attr (tb_show) of every tier up to the
+    character's current tier, plus the quality_attr bonus scaled by quality value."""
+    st = attire_state(c, show_id)
+    acc = {}
+    tiers = SHOW_CFG[show_id]
+    if tiers is not None:
+        for tier in range(1, st["level"] + 1):
+            row = tiers[tier]
+            if row is None:
+                continue
+            for aid, val in _attr_pairs(row["attr"]):
+                acc[aid] = acc.get(aid, 0) + val
+    ext = SHOW_EXT_CFG[show_id]
+    if ext is not None and st["quality"] > 0:
+        for aid, val in _attr_pairs(ext["quality_attr"]):
+            acc[aid] = acc.get(aid, 0) + val * st["quality"]
+    return compute_power(list(acc.items()))
 
 
 def monster_exp(mapmonster_key: int) -> int:
@@ -394,7 +453,8 @@ async def on_login_gateway(s: Session, req: dict):
         "playerid": s.player_id,
         "nickname": s.nickname,
         "mapid": s.mapid, "x": s.x, "y": s.y,    # spawn where the character logged out
-        "m_vecAttr": _flatten(player_attrs(s)) + [101, s.level, 104, total_power(s)],
+        "m_vecAttr": _flatten(player_attrs(s)) + [101, s.level, 104, total_power(s),
+                                                  151, char_figure1(char)],
         "skills": skills_for(s.profession),       # the character's profession skills
         "m_strGuildName": "", "m_nGuildID": 0, "m_nGuildJob": 0,
         "m_nExp": 0, "m_nAOISetting": 0, "m_nCreatedTime": 0,
@@ -455,13 +515,20 @@ async def on_query_ranking(s: Session, req: dict):
     name = req.get("m_strRankingName", "fight_ranking") or "fight_ranking"
     page = int(req.get("m_nPage", 0))
     entries = []
-    if ranking.kind_of(name) == "NORMAL":                # power/level/etc share NORMAL_INFO
+    if ranking.kind_of(name) == "NORMAL":                # power/level/attire share NORMAL_INFO
         chars = storage.all_characters()
-        if name == "level_ranking":
-            chars.sort(key=lambda c: (int(c.get("level", 1)), char_power(c)), reverse=True)
+        if name in ATTIRE_BOARDS:                        # weapon/mount/wing/armor attire boards
+            sid = ATTIRE_BOARDS[name]
+            powerfn = lambda c: attire_power(c, sid)
+            sortkey = powerfn
+        elif name == "level_ranking":
+            powerfn = char_power
+            sortkey = lambda c: (int(c.get("level", 1)), char_power(c))
         else:                                            # fight_ranking + other power boards
-            chars.sort(key=char_power, reverse=True)
-        entries = [{"playerid": c["playerid"], "power": char_power(c),
+            powerfn = char_power
+            sortkey = powerfn
+        chars.sort(key=sortkey, reverse=True)
+        entries = [{"playerid": c["playerid"], "power": powerfn(c),
                     "name": c.get("nickname", ""), "level": int(c.get("level", 1)),
                     "vip": 0, "guild": ""} for c in chars]
     max_page = ((len(entries) - 1) // RANK_PAGE_SIZE) if entries else 0
@@ -474,6 +541,115 @@ async def on_query_ranking(s: Session, req: dict):
     s.writer.write(HEADER.pack(0, op.GW_QUERY_RANKING, len(body)) + body)
     log.info("RANKING %s page=%d -> %d entries (me #%d)", name, page, len(page_entries), my + 1)
     return []
+
+
+def _exterior_slot(c: dict, show_id: int) -> dict:
+    """Get/create the persisted tier/bless/quality dict for one attire slot."""
+    return c.setdefault("exterior", {}).setdefault(
+        str(show_id), {"level": 1, "bless": 0, "quality": 0})
+
+
+@handler(op.GW_SHOW_QUERY)
+async def on_show_query(s: Session, req: dict):
+    """Attire page: return each of the 4 attire types with the player's current tier,
+    bless, quality and displayed figure. Without this the page is empty."""
+    c = storage.find_by_pid(s.player_id)
+    b = CByteBuffer()
+    b.WriteString(s.nickname or "")              # m_strName
+    b.WriteSize(len(ATTIRE_TYPES))               # m_vecInfo
+    for sid in ATTIRE_TYPES:
+        st = attire_state(c, sid)
+        illusion = int((c.get("figures", {}) if c else {}).get(str(sid), 0))
+        b.WriteByte(sid)                         # m_nID
+        b.WriteByte(st["level"])                 # m_nLevel (tier 1-10)
+        b.WriteUShort(min(0xFFFF, st["bless"]))  # m_nBless
+        b.WriteUShort(min(0xFFFF, st["quality"]))# m_nQuality
+        b.WriteByte(illusion)                    # m_nIllusion
+    body = b.ToBytes()
+    s.writer.write(HEADER.pack(0, op.GW_SHOW_QUERY, len(body)) + body)
+    log.info("ATTIRE query -> %d types for %s", len(ATTIRE_TYPES), s.nickname)
+    return []
+
+
+@handler(op.GW_SHOW_OPT)
+async def on_show_opt(s: Session, req: dict):
+    """Attire tier op. opt 1 = bless (fills toward the tier's bless threshold; on reaching
+    it the tier advances, up to 10), 2 = quality (+1). Real tier/bless data from tb_show;
+    the per-click bless step is simplified (the live game's bless RNG isn't recoverable)."""
+    opt = int(req.get("m_nOpt", 0))
+    sid = int(req.get("m_nID", 0))
+    c = storage.find_by_pid(s.player_id)
+    if c is not None and sid in ATTIRE_TYPES:
+        slot = _exterior_slot(c, sid)
+        tiers = SHOW_CFG[sid]
+        if opt == 1:                                   # bless
+            row = tiers[slot["level"]] if tiers is not None else None
+            threshold = int(row["bless"]) if row is not None and row["bless"] else 100
+            step = max(1, threshold // 4)
+            slot["bless"] += step
+            if slot["bless"] >= threshold and slot["level"] < ATTIRE_MAX_TIER:
+                slot["level"] += 1                     # advance a tier
+                slot["bless"] = 0
+        elif opt == 2:                                 # quality
+            slot["quality"] += 1
+        storage.save()
+        st = slot
+        return [(op.GW_SHOW_OPT, {"m_nRetCode": 0, "m_nOpt": opt, "m_nID": sid,
+                "m_nLevel": st["level"], "m_nBless": min(0xFFFF, st["bless"]),
+                "m_nQuality": min(0xFFFF, st["quality"]),
+                "m_nIllusion": int(c.get("figures", {}).get(str(sid), 0))})]
+    return [(op.GW_SHOW_OPT, {"m_nRetCode": 0, "m_nOpt": opt, "m_nID": sid,
+            "m_nLevel": 1, "m_nBless": 0, "m_nQuality": 0, "m_nIllusion": 0})]
+
+
+ATTIRE_STAR_MAX = 10   # m_star_limit in biz_illusion
+
+
+@handler(op.GW_SHOW_FIGURE_QUERY)
+async def on_show_figure_query(s: Session, req: dict):
+    """Attire panel query, per slot, for THIS player: which figure is displayed plus the
+    player's owned figures and their star levels. m_vecStar is a flat [figId, star, ...]
+    list the panel reads to mark owned appearances (biz_illusion:174)."""
+    genre = int(req.get("m_nGenre", 1))               # 1 player, 2 pet
+    show_id = int(req.get("m_nShowID", 0))            # SHOW_ID weapon/mount/wing/armor
+    c = storage.find_by_pid(s.player_id)
+    cur, owned = 0, {}
+    if genre == 1 and c is not None:
+        cur = int(c.get("figures", {}).get(str(show_id), 0))
+        owned = c.get("attire", {}).get(str(show_id), {})
+    vec = []
+    for fid_str, star in owned.items():
+        vec += [int(fid_str), int(star)]
+    return [(op.GW_SHOW_FIGURE_QUERY, {"m_nRetCode": 0, "m_nGenre": genre,
+            "m_nShowID": show_id, "m_nIllusion": cur, "m_vecStar": vec})]
+
+
+@handler(op.GW_SHOW_FIGURE_OPT)
+async def on_show_figure_opt(s: Session, req: dict):
+    """Attire op, persisted per player. opt 1 = activate (own it), 2 = upgrade star,
+    3 = display (repack FIGURE1 + push ATTR 151 so the world avatar shows the look)."""
+    opt = int(req.get("m_nOpt", 0))
+    genre = int(req.get("m_nGenre", 1))
+    show_id = int(req.get("m_nShowID", 0))
+    fig = int(req.get("m_nFigureID", 0))
+    star = 0
+    c = storage.find_by_pid(s.player_id)
+    if genre == 1 and c is not None:
+        slot = c.setdefault("attire", {}).setdefault(str(show_id), {})
+        if opt == 1:                                   # activate -> owned at 0 stars
+            slot.setdefault(str(fig), 0)
+        elif opt == 2:                                 # upgrade star
+            slot[str(fig)] = min(ATTIRE_STAR_MAX, int(slot.get(str(fig), 0)) + 1)
+        elif opt == 3:                                 # display on the character
+            slot.setdefault(str(fig), 0)               # displaying implies owning
+            c.setdefault("figures", {})[str(show_id)] = fig
+            s.push_aoi([{"type": 11, "m_nAvatarID": s.player_id or DEMO_PID,
+                         "m_vecAttr": [151, char_figure1(c)]}])   # ATTR_CHANGE FIGURE1
+        star = int(slot.get(str(fig), 0))
+        storage.save()
+        log.info("ATTIRE opt=%d show=%d figure=%d star=%d", opt, show_id, fig, star)
+    return [(op.GW_SHOW_FIGURE_OPT, {"m_nRetCode": 0, "m_nOpt": opt, "m_nGenre": genre,
+            "m_nShowID": show_id, "m_nFigureID": fig, "m_nStar": star})]
 
 
 AOE_RADIUS = 60   # network units (~6m) for picking nearby monsters in a skill's area
