@@ -194,6 +194,15 @@ def monster_exp(mapmonster_key: int) -> int:
     return int(info["exp"]) if info is not None else 0
 
 
+def monster_atk(mapmonster_key: int) -> int:
+    """Real attack stat for a monster (tb_monsterinfo[monsterid].atk)."""
+    mm = MAPMONSTER_CFG[mapmonster_key]
+    if mm is None:
+        return 0
+    info = MONSTERINFO_CFG[int(mm["monsterid"])]
+    return int(info["atk"]) if info is not None and info["atk"] else 0
+
+
 def monster_drop(mapmonster_key: int):
     """Pick one item id this monster drops (tb_mapmonster.map_drop = {{itemid,count,prob},..})."""
     mm = MAPMONSTER_CFG[mapmonster_key]
@@ -278,6 +287,9 @@ class Session:
         self.exp = 0
         self.power = 5000
         self.maxhp = 10000
+        self.hp = 10000                           # current HP (monsters can hurt the player)
+        self.player_dead = False                  # combat death (distinct from .alive = connection)
+        self.combat_task = None                   # monster AI / aggro loop
         self.monsters: dict[str, int] = {}        # monster uid -> current hp
         self.monster_pos: dict[str, tuple] = {}   # monster uid -> (x, y) network coords
         self.dropbags: dict[str, int] = {}        # dropbag uid -> itemid (on the ground)
@@ -378,6 +390,80 @@ async def time_pusher(s: Session):
         pass
 
 
+AGGRO_RADIUS = 220       # network units (~22m): monsters notice and chase the player
+MONSTER_ATTACK_RANGE = 40  # ~4m: close enough to strike
+MONSTER_MOVE_STEP = 70   # approach distance per combat tick
+COMBAT_TICK = 1.1        # seconds between monster AI ticks
+MAX_ATTACKERS = 6        # cap simultaneous attackers so a pack can't spam
+PLAYER_DEF = 200         # base mitigation (PLAYER_BASE_ATTRS DEF)
+
+
+async def combat_loop(s: Session):
+    """Living combat: each tick, monsters within aggro range chase the player and, once
+    in range, strike for real damage. The player's HP drops and they can die -> revive."""
+    try:
+        while s.alive:
+            await asyncio.sleep(COMBAT_TICK)
+            if not s.in_world or s.player_dead or not s.monsters:
+                continue
+            pid = s.player_id or DEMO_PID
+            px, py = s.x, s.y
+            events, attackers = [], 0
+            for uid in list(s.monsters.keys()):
+                mpos = s.monster_pos.get(uid)
+                if mpos is None:
+                    continue
+                mx, my = mpos
+                d2 = (px - mx) ** 2 + (py - my) ** 2
+                if d2 > AGGRO_RADIUS ** 2:
+                    continue                                   # out of aggro range
+                if d2 > MONSTER_ATTACK_RANGE ** 2:             # chase: step toward player
+                    dist = (d2 ** 0.5) or 1
+                    step = min(MONSTER_MOVE_STEP, dist - MONSTER_ATTACK_RANGE * 0.5)
+                    nx, ny = int(mx + (px - mx) / dist * step), int(my + (py - my) / dist * step)
+                    s.monster_pos[uid] = (nx, ny)
+                    events.append({"type": 8, "m_nAvatarID": uid, "x": nx, "y": ny})  # MOVE
+                    continue
+                if attackers >= MAX_ATTACKERS:
+                    continue
+                attackers += 1
+                tmpl = s.monster_spawns.get(uid)
+                atk = monster_atk(int(tmpl["m_nMonsterID"])) if tmpl else 100
+                crit = random.random() < 0.15
+                # real atk vs light mitigation, with a small floor (~0.5% max HP) so even
+                # weak monsters visibly chip the bar; high-level maps hit for hundreds.
+                dmg = max(s.maxhp // 200, int((atk - PLAYER_DEF // 4) * random.uniform(0.85, 1.15)))
+                if crit:
+                    dmg *= 2
+                s.hp = max(0, s.hp - dmg)
+                effect = 0x01 | (0x02 if crit else 0) | (0x04 if s.hp <= 0 else 0)
+                events.append({"type": 9, "m_nAvatarID": uid, "m_nTargetID": pid, "m_nSkillID": 0})  # ATTACK
+                events.append({"type": 10, "m_nAvatarID": pid, "m_nAttackerID": uid,
+                               "m_nEffect": effect, "m_nDamage": dmg, "m_nSkillID": 0})  # DAMAGE -> player
+                if s.hp <= 0:
+                    s.player_dead = True
+                    break
+            if events:
+                events.append({"type": 11, "m_nAvatarID": pid, "m_vecAttr": [15, s.hp]})  # HP bar
+                s.push_aoi(events)
+            if s.player_dead:
+                s.push(op.CL_REVIVE_INFO, {"m_nRetCode": 0, "m_nReviveTimes": 99, "m_nTire": 0})
+                log.info("PLAYER DIED -> awaiting revive")
+    except (ConnectionError, asyncio.CancelledError):
+        pass
+
+
+@handler(op.GW_PLAYER_REVIVE)
+async def on_player_revive(s: Session, req: dict):
+    rtype = int(req.get("m_nReviveType", 0))
+    s.hp = s.maxhp
+    s.player_dead = False
+    pid = s.player_id or DEMO_PID
+    s.push_aoi([{"type": 11, "m_nAvatarID": pid, "m_vecAttr": [15, s.hp]}])  # restore HP bar
+    log.info("PLAYER REVIVE type=%d -> hp=%d", rtype, s.hp)
+    return [(op.GW_PLAYER_REVIVE, {"m_nRetCode": 0, "m_nReviveType": rtype})]
+
+
 @handler(op.GBM_REGIST_USER)
 async def on_regist_user(s: Session, req: dict):
     s.session_id = req.get("m_strUserName") or "devplayer"
@@ -445,8 +531,11 @@ async def on_login_gateway(s: Session, req: dict):
         s.item_uid = max([s.item_uid] + [int(it["uid"]) for it in char.get("items", [])])
     log.info("LOGIN_GATEWAY enter-world pid=%s '%s' lvl=%d map=%d",
              s.player_id, s.nickname, s.level, s.mapid)
+    s.hp, s.player_dead = s.maxhp, False  # enter the world at full health
     if s.time_task is None:
         s.time_task = asyncio.create_task(time_pusher(s))
+    if s.combat_task is None:
+        s.combat_task = asyncio.create_task(combat_loop(s))   # monsters fight back
     _start_spawn(s)                       # populate the map a few seconds after entry
     push_equip_info(s)                    # seed equip-enhancement state so the forge/equip panel won't nil-crash
     return [(op.GW_LOGIN_GATEWAY, {
@@ -1122,6 +1211,8 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         save_session(s)               # persist level/exp/map/position on disconnect
         if s.time_task:
             s.time_task.cancel()
+        if s.combat_task:
+            s.combat_task.cancel()
         writer.close()
 
 
