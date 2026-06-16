@@ -50,6 +50,7 @@ TB_ITEM = proto.lua.require("public.staticdata.tb_item")       # item defs: item
 SHOW_FIGURE_CFG = proto.lua.require("public.staticdata.tb_show_figure")  # attire illusion: key (showID<<8)+figureID
 SHOW_CFG = proto.lua.require("public.staticdata.tb_show")        # attire tiers: [showID][tier] -> attr,bless,quality,figure
 SHOW_EXT_CFG = proto.lua.require("public.staticdata.tb_show_ext")  # per attire type: bless_attr, quality_attr, ...
+SHOP_CFG = proto.lua.require("public.staticdata.tb_shop")        # shops: [shopID][index] -> item, price, mtype, count
 
 # quest state values (business.txt TASK_STATUS) and update types (UPDATE_TASK)
 TS_CAN_ACCEPT, TS_ACCEPTED, TS_CAN_COMMIT, TS_COMMIT = 2, 3, 4, 5
@@ -603,6 +604,55 @@ async def on_show_opt(s: Session, req: dict):
 
 
 ATTIRE_STAR_MAX = 10   # m_star_limit in biz_illusion
+
+
+@handler(op.GW_SHOP_QUERY)
+async def on_shop_query(s: Session, req: dict):
+    """Shop open: the goods/prices are client-side config; we only report how many of
+    each item this player has already bought (for purchase limits)."""
+    shop_id = int(req.get("m_nShopID", 0))
+    c = storage.find_by_pid(s.player_id)
+    bought = (c.get("shop_bought", {}) if c else {}).get(str(shop_id), {})
+    shop = SHOP_CFG[shop_id]
+    counts = []
+    if shop is not None:
+        for i in sorted(int(k) for k in shop.keys()):
+            counts.append(min(0xFFFF, int(bought.get(str(i), 0))))
+    return [(op.GW_SHOP_QUERY, {"m_nRetCode": 0, "m_vecBuyCount": counts})]
+
+
+@handler(op.GW_SHOP_BUY)
+async def on_shop_buy(s: Session, req: dict):
+    """Buy an item: charge the chosen currency (price from tb_shop), add it to the bag,
+    and track the bought count against the item's purchase limit."""
+    shop_id = int(req.get("m_nShopID", 0))
+    index = int(req.get("m_nIndex", 0))
+    count = max(1, int(req.get("m_nCount", 1)))
+    mtype = int(req.get("m_nMType", 0))
+    shop = SHOP_CFG[shop_id]
+    entry = shop[index] if shop is not None else None
+    if entry is None:
+        return [(op.GW_SHOP_BUY, {"m_nRetCode": 1})]
+    itemid = int(entry["item"])
+    price = int(entry["discount"] or entry["price"] or 0)
+    cost = price * count
+    c = storage.find_by_pid(s.player_id)
+    bought = c.setdefault("shop_bought", {}).setdefault(str(shop_id), {}) if c is not None else {}
+    limit = int(entry["count"] or 0)                  # 0 = unlimited
+    already = int(bought.get(str(index), 0))
+    if limit > 0 and already + count > limit:
+        return [(op.GW_SHOP_BUY, {"m_nRetCode": 1})]  # over purchase limit
+    bal = s.diamond if mtype == 1 else s.gold if mtype == 2 else 0
+    if mtype in (1, 2) and bal < cost:
+        return [(op.GW_SHOP_BUY, {"m_nRetCode": 1})]  # not enough currency
+    if mtype in (1, 2) and cost > 0:
+        grant_money(s, mtype, -cost)                  # deduct + push wallet
+    give_item(s, itemid, count, auto_equip=False)     # into the bag
+    bought[str(index)] = already + count
+    if c is not None:
+        storage.save()
+    log.info("SHOP buy shop=%d idx=%d item=%d x%d cost=%d(type %d)", shop_id, index, itemid, count, cost, mtype)
+    return [(op.GW_SHOP_BUY, {"m_nRetCode": 0})]
 
 
 @handler(op.GW_SHOW_FIGURE_QUERY)

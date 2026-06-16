@@ -23,6 +23,8 @@ GW_TASK_OP       = 0x00050012  # quest accept/submit: req {m_nOpType(1=accept,2=
 GW_HEARTBEAT     = 0x00050015  # 327701, empty payload, every 10s
 GW_COMEBACK      = 0x00050017  # post-enter "unstuck" signal, empty
 
+GW_SHOP_BUY      = 0x00050025  # buy from a shop: req {m_nShopID, m_nIndex, m_nCount, m_nMType}
+GW_SHOP_QUERY    = 0x00050026  # query a shop: req {m_nShopID} -> {m_vecBuyCount} (per-item bought counts)
 GW_QUERY_RANKING = 0x00050027  # query a leaderboard: req {m_strRankingName, m_nPage} -> ranked list
 GW_SHOW_OPT      = 0x00050030  # attire tier op: req {m_nOpt(1=bless,2=quality,4=activate,5=mount), m_nID, m_nLevel}
 GW_SHOW_QUERY    = 0x00050031  # attire page query (no payload) -> {m_strName, m_vecInfo:[SHOW_INFO]}
